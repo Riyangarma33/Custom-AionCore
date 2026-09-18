@@ -116,6 +116,76 @@ impl SqliteConversationRepository {
         }
     }
 
+    async fn update_extra_and_mcp_snapshot_atomic(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        extra: String,
+        resolved_mcp_ids_json: Option<String>,
+        updated_at: TimestampMs,
+    ) -> Result<(), DbError> {
+        // Writer-lock-first transaction; see `insert_message_once` for why.
+        // Both halves of the runtime-binding update (the conversation `extra`
+        // JSON and the assistant snapshot's `resolved_mcp_ids`) commit together
+        // or not at all, so a crash can never leave the two tables describing
+        // different bindings.
+        let mut connection = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *connection).await?;
+
+        let result: Result<(), DbError> = async {
+            let result = sqlx::query(
+                "UPDATE conversations \
+                 SET extra = ?, updated_at = MAX(updated_at, ?) \
+               WHERE id = ? AND user_id = ?",
+            )
+            .bind(&extra)
+            .bind(updated_at)
+            .bind(conversation_id)
+            .bind(user_id)
+            .execute(&mut *connection)
+            .await?;
+
+            // Zero rows: no such conversation, or it belongs to another user.
+            // Roll back so the snapshot write below can never land without
+            // ownership being proven.
+            if result.rows_affected() == 0 {
+                return Err(DbError::NotFound(format!("conversation {conversation_id} not found for user")));
+            }
+
+            if let Some(resolved_mcp_ids) = resolved_mcp_ids_json.as_deref() {
+                // The snapshot row only exists for conversations created through
+                // the assistant/snapshot flow (aionrs conversations may
+                // legitimately have none). Updating zero rows here is fine:
+                // `conversations.extra` remains the single source of truth for
+                // the runtime binding.
+                sqlx::query(
+                    "UPDATE conversation_assistant_snapshots \
+                     SET resolved_mcp_ids = ?, updated_at = MAX(updated_at, ?) \
+                   WHERE conversation_id = ?",
+                )
+                .bind(resolved_mcp_ids)
+                .bind(updated_at)
+                .bind(conversation_id)
+                .execute(&mut *connection)
+                .await?;
+            }
+
+            Ok(())
+        }
+        .await;
+
+        match result {
+            Ok(()) => {
+                sqlx::query("COMMIT").execute(&mut *connection).await?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                Err(error)
+            }
+        }
+    }
+
     async fn upsert_message_once(&self, user_id: &str, message: &MessageRow) -> Result<(), DbError> {
         // Writer-lock-first transaction; see `insert_message_once` for why.
         let mut connection = self.pool.acquire().await?;
@@ -1497,6 +1567,24 @@ impl IConversationRepository for SqliteConversationRepository {
         .await?;
 
         Ok(rows)
+    }
+
+    async fn update_extra_and_mcp_snapshot_atomic(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        extra: String,
+        resolved_mcp_ids_json: Option<String>,
+        updated_at: TimestampMs,
+    ) -> Result<(), DbError> {
+        self.update_extra_and_mcp_snapshot_atomic(
+            user_id,
+            conversation_id,
+            extra,
+            resolved_mcp_ids_json,
+            updated_at,
+        )
+        .await
     }
 }
 

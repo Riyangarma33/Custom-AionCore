@@ -126,6 +126,40 @@ pub trait IConversationRepository: Send + Sync {
         Ok(None)
     }
 
+    /// Atomically persists an in-conversation runtime-binding change
+    /// (Phase 2A "Supported Update Path"):
+    ///
+    /// 1. replaces `conversations.extra` with `extra` and bumps `updated_at`,
+    /// 2. and, when `resolved_mcp_ids_json` is `Some`, rewrites
+    ///    `conversation_assistant_snapshots.resolved_mcp_ids` for the
+    ///    conversation.
+    ///
+    /// Both writes are wrapped in a single transaction so a mid-flight crash
+    /// can never leave `extra` describing one binding while the snapshot
+    /// records another. Ownership is enforced: the writes only apply when
+    /// `conversations.user_id` matches, otherwise nothing is changed.
+    ///
+    /// A missing snapshot row is not an error (aionrs conversations created
+    /// outside the assistant/snapshot flow legitimately have none); `extra`
+    /// remains the single source of truth for the binding.
+    ///
+    /// Defaults to an error so the repository stubs in tests surface an
+    /// explicit "unsupported" instead of silently reporting success for a
+    /// write that never happened.
+    async fn update_extra_and_mcp_snapshot_atomic(
+        &self,
+        _user_id: &str,
+        _conversation_id: &str,
+        _extra: String,
+        _resolved_mcp_ids_json: Option<String>,
+        _updated_at: TimestampMs,
+    ) -> Result<(), DbError> {
+        let (_, _, _) = (&_extra, &_resolved_mcp_ids_json, _updated_at);
+        Err(DbError::NotFound(
+            "update_extra_and_mcp_snapshot_atomic is not supported by this repository".to_string(),
+        ))
+    }
+
     /// Deletes the assistant snapshot bound to a conversation.
     async fn delete_assistant_snapshot(&self, _user_id: &str, _conversation_id: &str) -> Result<bool, DbError> {
         Ok(false)

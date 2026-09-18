@@ -24,7 +24,8 @@ use aionui_api_types::{
     ListMessagesQuery, McpRuntimeSnapshot, MessageListResponse, MessageResponse, MessageSearchResponse,
     PromptCapabilityView, SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionMcpServer,
     SessionMcpTransport, TEAM_MCP_SERVER_NAME, TeamMcpSelection, TeamSessionBinding, UpdateConversationArtifactRequest,
-    UpdateConversationRequest, WebSocketMessage, assistant_avatar_response_value,
+    UpdateConversationRequest, UpdateConversationRuntimeBindingsRequest, UpdateConversationRuntimeBindingsResponse,
+    WebSocketMessage, assistant_avatar_response_value,
     assistant_avatar_response_value_with_version, assistant_mcp_binding_fingerprint,
 };
 use aionui_api_types::{ChatFileRef, SessionRef};
@@ -2296,7 +2297,7 @@ impl ConversationService {
                 || incoming.get("session_mcp_servers").is_some())
         {
             return Err(ConversationError::BadRequest {
-                reason: "extra.skills and MCP snapshots are immutable post-creation".into(),
+                reason: "extra.skills and MCP snapshots are immutable post-creation (in-chat MCP & skill changes go through POST /conversations/{id}/runtime/bindings, the supported dynamic path)".into(),
             });
         }
 
@@ -4556,6 +4557,321 @@ impl ConversationService {
     /// Conversation messages, artifacts, and the persisted backend session anchor
     /// are intentionally left untouched so the rebuilt runtime can resume the
     /// existing backend session.
+    /// In-conversation runtime-binding update (Phase 2A "Supported Update
+    /// Path"): atomically writes the desired MCP server / skill selection into
+    /// `conversations.extra` (the four `mcp_*` fields plus `skills`) and
+    /// rewrites `conversation_assistant_snapshots.resolved_mcp_ids` in a
+    /// single transaction, then restarts the cached agent runtime so the
+    /// change applies to the active session. Chat history is untouched.
+    ///
+    /// This dedicated path exists because the generic `update` handler
+    /// (correctly) rejects `extra` MCP/skill patches — ad-hoc edits cannot
+    /// keep `extra` and the persisted snapshot consistent, so that guard
+    /// stays and this is the only supported dynamic route.
+    ///
+    /// Commit-first contract: if the runtime restart fails (or is already in
+    /// flight), the binding change is still persisted; the next
+    /// `/runtime/ensure` (or the in-flight restart) picks it up. The response
+    /// reports exactly what happened so the UI can say the same.
+    #[tracing::instrument(skip_all, fields(user_id = %user_id, conversation_id = %conversation_id))]
+    pub async fn update_runtime_bindings(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        req: UpdateConversationRuntimeBindingsRequest,
+        task_manager: &Arc<dyn IWorkerTaskManager>,
+    ) -> Result<UpdateConversationRuntimeBindingsResponse, ConversationError> {
+        if req.mcp_server_ids.is_none() && req.skills.is_none() {
+            return Err(ConversationError::BadRequest {
+                reason: "at least one of `mcp_server_ids` or `skills` is required".to_string(),
+            });
+        }
+
+        let row = self
+            .conversation_repo
+            .get(user_id, conversation_id)
+            .await?
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
+        // Team-owned conversations run inside a team slot; the standalone
+        // runtime path cannot see them. Same guard as `restart_runtime`.
+        if let Some(team_id) = team_id_from_extra(&row.extra) {
+            info!(
+                team_id,
+                "Rejected standalone runtime-binding update for team-owned conversation"
+            );
+            return Err(ConversationError::TeamRuntimeRequired {
+                conversation_id: conversation_id.to_owned(),
+                team_id,
+            });
+        }
+        let agent_type = parse_agent_type_from_row(&row).ok_or_else(|| ConversationError::BadRequest {
+            reason: format!(
+                "conversation '{conversation_id}' has no resolvable agent type; cannot resolve the MCP snapshot"
+            ),
+        })?;
+        let mut extra: serde_json::Value = serde_json::from_str(&row.extra).map_err(|error| {
+            ConversationError::BadRequest {
+                reason: format!("conversation '{conversation_id}' has a corrupted extra payload: {error}"),
+            }
+        })?;
+
+        // ---- Desired MCP selection (explicit, or the current one) ---------
+        let requested_mcp_ids = req.mcp_server_ids.as_ref().map(|ids| {
+            ids.iter()
+                .map(|id| id.trim().to_string())
+                .filter(|id| !id.is_empty())
+                .collect::<Vec<_>>()
+        });
+        let selected_mcp_ids = match requested_mcp_ids {
+            Some(ids) => ids,
+            None => extra
+                .get("mcp_server_ids")
+                .and_then(|value| value.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(str::to_string))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
+        };
+        let runtime_snapshot = self
+            .resolve_binding_selection(user_id, &agent_type, &extra, &selected_mcp_ids)
+            .await?;
+
+        // ---- Desired skill selection (explicit, or the current one) -------
+        let requested_skills = req.skills.as_ref().map(|names| {
+            let mut seen = std::collections::HashSet::new();
+            names
+                .iter()
+                .map(|name| name.trim().to_string())
+                .filter(|name| !name.is_empty() && seen.insert(name.clone()))
+                .collect::<Vec<_>>()
+        });
+        let skills_list = match requested_skills.as_deref() {
+            Some(names) => {
+                // Resolve against the user's mounted skills; unknown names are
+                // rejected explicitly so the UI never persists a selection the
+                // runtime cannot honor.
+                let resolved = self.skill_resolver.resolve_skills_for_user(user_id, names).await;
+                let resolved_names: std::collections::HashSet<&str> =
+                    resolved.iter().map(|skill| skill.name.as_str()).collect();
+                let unknown: Vec<String> = names
+                    .iter()
+                    .filter(|name| !resolved_names.contains(name.as_str()))
+                    .cloned()
+                    .collect();
+                if !unknown.is_empty() {
+                    return Err(ConversationError::BadRequest {
+                        reason: format!("unknown skill(s): {}", unknown.join(", ")),
+                    });
+                }
+                // Keep the on-disk skill view in sync right away so even a
+                // failed restart leaves the next /runtime/ensure with a
+                // consistent view directory.
+                self.skill_resolver
+                    .sync_skill_view(user_id, conversation_id, &resolved)
+                    .await;
+                names.to_vec()
+            }
+            None => extra
+                .get("skills")
+                .and_then(|value| value.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(str::to_string))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
+        };
+
+        // ---- Persist: extra + snapshot in ONE transaction ------------------
+        extra["mcp_server_ids"] = serde_json::json!(runtime_snapshot.mcp_server_ids);
+        extra["mcp_servers"] = serde_json::to_value(&runtime_snapshot.mcp_servers).map_err(|error| {
+            ConversationError::BadRequest {
+                reason: format!("failed to serialize the MCP server list: {error}"),
+            }
+        })?;
+        extra["mcp_statuses"] = serde_json::to_value(&runtime_snapshot.mcp_statuses).map_err(|error| {
+            ConversationError::BadRequest {
+                reason: format!("failed to serialize the MCP statuses: {error}"),
+            }
+        })?;
+        // Mirror create(): the `session_mcp_servers` key only exists when
+        // there is something to record (or already was).
+        if !runtime_snapshot.session_mcp_servers.is_empty() || extra.get("session_mcp_servers").is_some() {
+            extra["session_mcp_servers"] = serde_json::to_value(&runtime_snapshot.session_mcp_servers).map_err(
+                |error| ConversationError::BadRequest {
+                    reason: format!("failed to serialize the session MCP servers: {error}"),
+                },
+            )?;
+        }
+        if requested_skills.is_some() {
+            extra["skills"] = serde_json::json!(skills_list);
+        }
+        // The snapshot row only exists for conversations created through the
+        // assistant/snapshot flow; for plain aionrs conversations there is
+        // nothing to rewrite and `extra` remains the single source of truth.
+        let resolved_mcp_ids_json =
+            if self.conversation_repo.get_assistant_snapshot(user_id, conversation_id).await?.is_some() {
+                Some(
+                    serde_json::to_string(&runtime_snapshot.mcp_server_ids).map_err(|error| {
+                        ConversationError::BadRequest {
+                            reason: format!("failed to serialize the resolved MCP ids: {error}"),
+                        }
+                    })?,
+                )
+            } else {
+                None
+            };
+
+        self.conversation_repo
+            .update_extra_and_mcp_snapshot_atomic(
+                user_id,
+                conversation_id,
+                extra.to_string(),
+                resolved_mcp_ids_json,
+                now_ms(),
+            )
+            .await?;
+
+        // ---- Restart the cached runtime so the change applies now ---------
+        let mut restarted = false;
+        let mut restart_pending = false;
+        let mut restart_error: Option<String> = None;
+        let mut runtime = self.runtime_summary_for(conversation_id).await;
+        if task_manager.get_task(conversation_id).is_some() {
+            match self.restart_runtime(user_id, conversation_id, task_manager).await {
+                Ok(response) => {
+                    runtime = response.runtime;
+                    restarted = true;
+                }
+                Err(ConversationError::RuntimeRestarting { .. }) => {
+                    // A restart is already in flight with the pre-update
+                    // binding loaded; the next /runtime/ensure (or the
+                    // restart that just finished) picks the new binding up.
+                    restart_pending = true;
+                }
+                Err(error) => {
+                    // Commit-first contract: the binding change is durable;
+                    // surface the restart failure instead of failing the
+                    // whole request.
+                    warn!(
+                        conversation_id,
+                        error = %error,
+                        "Runtime-binding change persisted but the runtime restart failed"
+                    );
+                    restart_error = Some(error.to_string());
+                }
+            }
+        }
+
+        let updated_row = self
+            .conversation_repo
+            .get(user_id, conversation_id)
+            .await?
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
+        let conversation = row_to_response(updated_row, &self.workspace_root)?;
+        self.broadcast_list_changed(user_id, conversation_id, "updated", conversation.source.as_ref());
+        Ok(UpdateConversationRuntimeBindingsResponse {
+            conversation,
+            mcp: runtime_snapshot,
+            skills: skills_list,
+            restarted,
+            restart_pending,
+            restart_error,
+            runtime,
+        })
+    }
+
+    /// Resolve a registry-id selection into a full [`McpRuntimeSnapshot`].
+    ///
+    /// - Unknown ids are rejected explicitly instead of being silently
+    ///   dropped, so the caller's UI never persists a typo.
+    /// - Builtin rows become session servers (the same conversion the
+    ///   assistant binding path uses); other injectable rows stay
+    ///   registry-backed.
+    /// - Session servers already recorded in `extra` that the new selection
+    ///   does not re-produce are preserved (request-provided session MCPs
+    ///   from create-time).
+    async fn resolve_binding_selection(
+        &self,
+        user_id: &str,
+        agent_type: &AgentType,
+        extra: &serde_json::Value,
+        selected: &[String],
+    ) -> Result<McpRuntimeSnapshot, ConversationError> {
+        let mcp_repo = self
+            .mcp_server_repo
+            .read()
+            .ok()
+            .and_then(|guard| guard.as_ref().cloned())
+            .ok_or_else(|| ConversationError::internal("MCP server repository is not initialized"))?;
+
+        let rows = if selected.is_empty() {
+            Vec::new()
+        } else {
+            mcp_repo.list_by_ids_any(user_id, selected).await?
+        };
+        let rows_by_id: std::collections::HashMap<String, McpServerRow> =
+            rows.into_iter().map(|row| (row.id.clone(), row)).collect();
+        let unknown: Vec<String> = selected
+            .iter()
+            .filter(|id| !rows_by_id.contains_key(*id))
+            .cloned()
+            .collect();
+        if !unknown.is_empty() {
+            return Err(ConversationError::BadRequest {
+                reason: format!("unknown MCP server id(s): {}", unknown.join(", ")),
+            });
+        }
+
+        let mut session_servers: Vec<SessionMcpServer> = Vec::new();
+        let mut failed_statuses: Vec<ConversationMcpStatus> = Vec::new();
+        let mut registry_ids: Vec<String> = Vec::new();
+        for id in selected {
+            let Some(row) = rows_by_id.get(id) else {
+                continue;
+            };
+            if !assistant_mcp_row_is_injectable(row) {
+                continue;
+            }
+            if row.builtin {
+                match aionui_ai_agent::mcp_resolve::row_to_session_mcp_server(row).await {
+                    Ok(server) => session_servers.push(server),
+                    Err(reason) => failed_statuses.push(ConversationMcpStatus {
+                        id: row.id.clone(),
+                        name: row.name.clone(),
+                        status: ConversationMcpStatusKind::Failed,
+                        reason: Some(reason),
+                    }),
+                }
+            } else {
+                registry_ids.push(id.clone());
+            }
+        }
+
+        let selection_names: std::collections::HashSet<String> =
+            rows_by_id.values().map(|row| row.name.clone()).collect();
+        let existing_session_servers: Vec<SessionMcpServer> = extra
+            .get("session_mcp_servers")
+            .and_then(|value| serde_json::from_value::<Vec<SessionMcpServer>>(value.clone()).ok())
+            .unwrap_or_default();
+        for server in existing_session_servers {
+            if !selection_names.contains(&server.name) && !session_servers.iter().any(|s| s.name == server.name) {
+                session_servers.push(server);
+            }
+        }
+
+        self.build_runtime_mcp_snapshot(user_id, Some(&registry_ids), &session_servers, &failed_statuses, agent_type, extra)
+            .await
+    }
+
     #[tracing::instrument(skip_all, fields(user_id = %user_id, conversation_id = %conversation_id))]
     pub async fn restart_runtime(
         &self,

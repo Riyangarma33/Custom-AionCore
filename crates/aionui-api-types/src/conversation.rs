@@ -34,7 +34,7 @@ pub struct ConversationMcpStatus {
 /// Shared by `aionui-conversation` (which builds it), `aionui-team` (which
 /// refreshes it on attach) and `aionui-app` (which wires the two), so the team
 /// refresh path never has to reason about raw JSON or raw DB rows.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpRuntimeSnapshot {
     /// Selected non-builtin MCP row ids (the `mcp_server_ids` extra field).
     pub mcp_server_ids: Vec<String>,
@@ -248,6 +248,51 @@ pub struct ConversationRuntimeSummary {
 pub struct EnsureConversationRuntimeResponse {
     pub recovered: bool,
     pub config_options: Vec<AcpConfigOptionDto>,
+    pub runtime: ConversationRuntimeSummary,
+}
+
+/// Request body for `POST /api/conversations/{id}/runtime/bindings`.
+///
+/// In-conversation dynamic MCP/skill binding update (Phase 2A). At least one
+/// field must be present; every field that IS present is applied as the new
+/// per-conversation selection (`None` means "leave untouched").
+///
+/// This is the supported dynamic path: the handler writes
+/// `conversations.extra` (the four `mcp_*` fields + `skills`) and
+/// `conversation_assistant_snapshots.resolved_mcp_ids` atomically, then
+/// restarts the cached agent runtime. Chat history is never touched.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct UpdateConversationRuntimeBindingsRequest {
+    /// Desired registry-backed MCP server ids for this conversation. Builtin
+    /// rows among them are converted into session servers automatically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_server_ids: Option<Vec<String>>,
+    /// Desired skill names for this conversation (full list, not a delta).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skills: Option<Vec<String>>,
+}
+
+/// What happened to the runtime restart after the binding transaction
+/// committed. Commit-first contract: the binding change is durable even when
+/// `restarted` is false — the next `/runtime/ensure` (or the in-flight
+/// restart) picks the new binding up.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateConversationRuntimeBindingsResponse {
+    /// Freshly re-read conversation row (new `extra` reflected).
+    pub conversation: ConversationResponse,
+    /// The MCP runtime snapshot that was persisted into `extra`.
+    pub mcp: McpRuntimeSnapshot,
+    /// The final skill list persisted into `extra.skills`.
+    pub skills: Vec<String>,
+    /// True when the cached runtime was restarted during this request.
+    pub restarted: bool,
+    /// True when a restart was already in flight; the new binding applies on
+    /// the next restart/ensure instead.
+    pub restart_pending: bool,
+    /// Set when the restart was attempted and failed; the binding change is
+    /// still persisted and applies on the next `/runtime/ensure`.
+    pub restart_error: Option<String>,
+    /// Current runtime summary (post-restart when a restart succeeded).
     pub runtime: ConversationRuntimeSummary,
 }
 

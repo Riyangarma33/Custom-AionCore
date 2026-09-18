@@ -13,6 +13,7 @@ use aionui_api_types::{
     CreateConversationRequest, EnsureConversationRuntimeResponse, ForkConversationRequest, ListConversationsQuery,
     ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchResponse, SearchMessagesQuery,
     SendMessageRequest, SendMessageResponse, UpdateConversationArtifactRequest, UpdateConversationRequest,
+    UpdateConversationRuntimeBindingsRequest, UpdateConversationRuntimeBindingsResponse,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -135,6 +136,10 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
         )
         .route("/api/conversations/{id}/runtime/ensure", post(ensure_runtime))
         .route("/api/conversations/{id}/runtime/restart", post(restart_runtime))
+        .route(
+            "/api/conversations/{id}/runtime/bindings",
+            post(update_runtime_bindings),
+        )
         .route("/api/conversations/{id}/active-lease", post(active_lease))
         // Confirmation system
         .route("/api/conversations/{id}/confirmations", get(list_confirmations))
@@ -407,6 +412,24 @@ async fn restart_runtime(
     let response = state
         .service
         .restart_runtime(&user.id, &id, &state.task_manager)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(response)))
+}
+
+/// In-chat dynamic MCP servers & skills management (Phase 2A): applies a new
+/// per-conversation binding atomically and restarts the cached runtime so it
+/// applies to the active session. Chat history is kept.
+async fn update_runtime_bindings(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Result<Json<UpdateConversationRuntimeBindingsRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<UpdateConversationRuntimeBindingsResponse>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let response = state
+        .service
+        .update_runtime_bindings(&user.id, &id, req, &state.task_manager)
         .await
         .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(response)))
