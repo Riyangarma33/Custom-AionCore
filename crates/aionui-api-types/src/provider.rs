@@ -54,6 +54,8 @@ pub struct ModelSettings {
     pub image_input: Option<ModelImageInputCapability>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub openai_api_mode: Option<ModelOpenAiApiMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<usize>,
 }
 
 /// Health status values for a model.

@@ -136,3 +136,36 @@ fn explicit_api_mode_keeps_unrecognized_complete_url_but_controls_wire_format() 
     assert_eq!(compat.api_path.as_deref(), Some(""));
     assert_eq!(compat.openai_api_mode, Some(OpenAiApiMode::Responses));
 }
+
+#[test]
+fn resolve_model_compat_overrides_reads_context_window() {
+    let json = r#"{"claude-3-5-sonnet":{"context_window":32768}}"#;
+    let overrides = resolve_model_compat_overrides("claude-3-5-sonnet", json).unwrap();
+    assert_eq!(overrides.context_window, Some(32768));
+    assert_eq!(overrides.image_input, None);
+    assert_eq!(overrides.openai_api_mode, None);
+}
+
+#[test]
+fn resolve_model_compat_overrides_reads_all_fields() {
+    let json = r#"{"gpt-4o":{"image_input":"supported","openai_api_mode":"responses","context_window":128000}}"#;
+    let overrides = resolve_model_compat_overrides("gpt-4o", json).unwrap();
+    assert_eq!(overrides.context_window, Some(128000));
+    assert_eq!(overrides.image_input, Some(ImageInputCapability::Supported));
+    assert_eq!(overrides.openai_api_mode, Some(OpenAiApiMode::Responses));
+}
+
+#[test]
+fn resolve_model_compat_overrides_omits_missing_context_window() {
+    let json = r#"{"claude-3-5-sonnet":{"image_input":"supported"}}"#;
+    let overrides = resolve_model_compat_overrides("claude-3-5-sonnet", json).unwrap();
+    assert_eq!(overrides.context_window, None);
+    assert_eq!(overrides.image_input, Some(ImageInputCapability::Supported));
+}
+
+#[test]
+fn validate_context_window_behavior() {
+    assert_eq!(validate_context_window(200_000, "test-model"), 200_000);
+    assert_eq!(validate_context_window(500, "test-model"), MIN_CONTEXT_WINDOW);
+    assert_eq!(validate_context_window(20_000_000, "test-model"), MAX_CONTEXT_WINDOW);
+}

@@ -4,7 +4,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use aion_config::config::{McpServerConfig, TransportType};
+use aion_config::config::{CompactContextWindowSource, McpServerConfig, TransportType};
 use tokio::sync::broadcast::error::TryRecvError;
 use tokio::time::timeout;
 
@@ -342,4 +342,61 @@ async fn runtime_can_emit_error_and_finish() {
         AgentStreamEvent::Finish(_) => {}
         other => panic!("Expected Finish, got {:?}", other),
     }
+}
+
+#[test]
+fn build_aionrs_config_uses_db_override_when_present() {
+    let mut cfg = make_test_config();
+    cfg.compat_overrides.context_window = Some(128_000);
+    let config = build_aionrs_config("/tmp/test-workspace", &cfg).unwrap();
+    assert_eq!(config.compact.context_window, 128_000);
+    assert_eq!(
+        config.compact_context_window_source,
+        CompactContextWindowSource::Explicit
+    );
+}
+
+#[test]
+fn build_aionrs_config_clamps_out_of_range_db_overrides() {
+    let mut cfg = make_test_config();
+    cfg.compat_overrides.context_window = Some(500); // below MIN_CONTEXT_WINDOW (1,000)
+    let config = build_aionrs_config("/tmp/test-workspace", &cfg).unwrap();
+    assert_eq!(config.compact.context_window, 1_000);
+    assert_eq!(
+        config.compact_context_window_source,
+        CompactContextWindowSource::Explicit
+    );
+
+    let mut cfg_high = make_test_config();
+    cfg_high.compat_overrides.context_window = Some(50_000_000); // above MAX_CONTEXT_WINDOW (10,000,000)
+    let config_high = build_aionrs_config("/tmp/test-workspace", &cfg_high).unwrap();
+    assert_eq!(config_high.compact.context_window, 10_000_000);
+    assert_eq!(
+        config_high.compact_context_window_source,
+        CompactContextWindowSource::Explicit
+    );
+}
+
+#[test]
+fn build_aionrs_config_preserves_catalog_or_default_when_no_override() {
+    let cfg = make_test_config(); // compat_overrides.context_window is None
+    let config = build_aionrs_config("/tmp/test-workspace", &cfg).unwrap();
+    // For claude-sonnet-4-20250514 with provider anthropic, upstream model catalog resolves 200,000
+    assert_eq!(config.compact.context_window, 200_000);
+    assert_eq!(
+        config.compact_context_window_source,
+        CompactContextWindowSource::ModelCatalog
+    );
+}
+
+#[test]
+fn build_aionrs_config_falls_back_to_default_for_unknown_model_without_override() {
+    let mut cfg = make_test_config();
+    cfg.model = "completely-unknown-custom-model-xyz".into();
+    let config = build_aionrs_config("/tmp/test-workspace", &cfg).unwrap();
+    assert_eq!(config.compact.context_window, 200_000);
+    assert_eq!(
+        config.compact_context_window_source,
+        CompactContextWindowSource::Default
+    );
 }

@@ -153,6 +153,7 @@ pub(super) async fn build(
         model_overrides.openai_api_mode,
     );
     compat_overrides.image_input = model_overrides.image_input;
+    compat_overrides.context_window = model_overrides.context_window;
 
     if provider == "openai" {
         info!(
@@ -490,6 +491,32 @@ fn rewrite_openai_api_url(url: &str, mode: OpenAiApiMode) -> Option<String> {
 pub(crate) struct ModelCompatOverrides {
     pub(crate) image_input: Option<ImageInputCapability>,
     pub(crate) openai_api_mode: Option<OpenAiApiMode>,
+    pub(crate) context_window: Option<usize>,
+}
+
+pub(crate) const MIN_CONTEXT_WINDOW: usize = 1_000;
+pub(crate) const MAX_CONTEXT_WINDOW: usize = 10_000_000;
+
+pub(crate) fn validate_context_window(raw: usize, model: &str) -> usize {
+    if raw < MIN_CONTEXT_WINDOW {
+        tracing::warn!(
+            model,
+            raw_context_window = raw,
+            clamped_to = MIN_CONTEXT_WINDOW,
+            "Explicit context window is too small; clamping to minimum safe threshold"
+        );
+        MIN_CONTEXT_WINDOW
+    } else if raw > MAX_CONTEXT_WINDOW {
+        tracing::warn!(
+            model,
+            raw_context_window = raw,
+            clamped_to = MAX_CONTEXT_WINDOW,
+            "Explicit context window looks implausibly large; clamping to maximum safe threshold"
+        );
+        MAX_CONTEXT_WINDOW
+    } else {
+        raw
+    }
 }
 
 pub(crate) fn resolve_model_compat_overrides(
@@ -512,6 +539,7 @@ pub(crate) fn resolve_model_compat_overrides(
             ModelOpenAiApiMode::ChatCompletions => OpenAiApiMode::ChatCompletions,
             ModelOpenAiApiMode::Responses => OpenAiApiMode::Responses,
         }),
+        context_window: settings.context_window,
     })
 }
 

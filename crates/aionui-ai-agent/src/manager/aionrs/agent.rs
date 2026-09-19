@@ -10,7 +10,7 @@ use aion_agent::engine::AgentEngine;
 use aion_agent::output::OutputSink;
 use aion_agent::session::Session;
 use aion_config::compat::ProviderCompat;
-use aion_config::config::{CliArgs, Config, McpServerConfig, ProviderType};
+use aion_config::config::{CliArgs, CompactContextWindowSource, Config, McpServerConfig, ProviderType};
 use aion_mcp::manager::McpManager;
 use aion_protocol::commands::{ApprovalScope, SessionMode};
 use aion_protocol::{ToolApprovalManager, ToolApprovalResult};
@@ -33,6 +33,7 @@ use crate::capability::backend_protocol_sink::BackendProtocolSink;
 use crate::capability::image_input::resolve_image_input_capability;
 use crate::dev_prompt_dump::{AgentFinalInputDump, dump_agent_final_input};
 use crate::error::AgentError;
+use crate::factory::aionrs::validate_context_window;
 use crate::protocol::events::AgentStreamEvent;
 use crate::protocol::send_error::AgentSendError;
 use crate::types::{AionrsResolvedConfig, SendMessageData};
@@ -54,6 +55,79 @@ fn resolve_aionui_config(cli_args: &CliArgs) -> Result<Config, AgentError> {
     };
     config.compat.transport.default_max_tokens = default_transport.default_max_tokens;
     config.compat.transport.model_max_tokens = default_transport.model_max_tokens;
+
+    Ok(config)
+}
+
+pub(crate) fn build_aionrs_config(
+    workspace: &str,
+    config_extra: &AionrsResolvedConfig,
+) -> Result<Config, AgentError> {
+    let image_input_override = config_extra.compat_overrides.image_input;
+    let image_input_capability = image_input_override.unwrap_or_else(|| {
+        resolve_image_input_capability(
+            &config_extra.provider,
+            config_extra.base_url.as_deref(),
+            &config_extra.model,
+        )
+    });
+    info!(
+        provider = %config_extra.provider,
+        model = %config_extra.model,
+        image_input_capability = ?image_input_capability,
+        image_input_source = if image_input_override.is_some() { "provider_settings" } else { "catalog" },
+        "Resolved image input capability for Aionrs model"
+    );
+
+    let cli_args = CliArgs {
+        provider: Some(config_extra.provider.clone()),
+        api_key: Some(config_extra.api_key.clone()),
+        base_url: config_extra.base_url.clone(),
+        model: Some(config_extra.model.clone()),
+        max_tokens: None,
+        max_turns: config_extra.max_turns,
+        max_tool_call_malformed_turns: config_extra.max_tool_call_malformed_turns,
+        max_tool_call_failure_turns: config_extra.max_tool_call_failure_turns,
+        system_prompt: config_extra.system_prompt.clone(),
+        profile: None,
+        auto_approve: config_extra.session_mode.as_deref() == Some("yolo"),
+        thinking: None,
+        thinking_budget: None,
+        project_dir: Some(PathBuf::from(workspace)),
+    };
+
+    let mut config = resolve_aionui_config(&cli_args)?;
+
+    // Backend-specific overrides
+    config.bedrock = config_extra.bedrock_config.clone();
+    config.session.enabled = true;
+    config.session.directory = config_extra.session_directory.to_string_lossy().into_owned();
+    config.compat.image_input = Some(image_input_capability);
+
+    if let Some(mode) = config_extra.compat_overrides.openai_api_mode {
+        config.compat.transport.openai_api_mode = Some(mode);
+    }
+    if let Some(ref field) = config_extra.compat_overrides.max_tokens_field {
+        config.compat.transport.max_tokens_field = Some(field.clone());
+    }
+    if let Some(ref path) = config_extra.compat_overrides.api_path {
+        config.compat.transport.api_path = Some(path.clone());
+    }
+
+    if let Some(context_window) = config_extra.compat_overrides.context_window {
+        let validated = validate_context_window(context_window, &config_extra.model);
+        config.compact.context_window = validated;
+        config.compact_context_window_source = CompactContextWindowSource::Explicit;
+        info!(
+            model = %config_extra.model,
+            context_window = validated,
+            "Applied explicit context window override from model settings"
+        );
+    }
+
+    if !config_extra.extra_mcp_servers.is_empty() {
+        config.mcp.servers.extend(config_extra.extra_mcp_servers.clone());
+    }
 
     Ok(config)
 }
@@ -146,22 +220,6 @@ impl AionrsAgentManager {
         let runtime = AgentRuntime::new(conversation_id.clone(), workspace.clone(), 128);
         let sink: Arc<dyn OutputSink> = Arc::new(BackendOutputSink::new(runtime.event_sender()));
         let runtime_env = config_extra.runtime_env.clone();
-        let image_input_override = config_extra.compat_overrides.image_input;
-        let image_input_capability = image_input_override.unwrap_or_else(|| {
-            resolve_image_input_capability(
-                &config_extra.provider,
-                config_extra.base_url.as_deref(),
-                &config_extra.model,
-            )
-        });
-        info!(
-            conversation_id = %conversation_id,
-            provider = %config_extra.provider,
-            model = %config_extra.model,
-            image_input_capability = ?image_input_capability,
-            image_input_source = if image_input_override.is_some() { "provider_settings" } else { "catalog" },
-            "Resolved image input capability for Aionrs model"
-        );
         let final_input_dump = config_extra
             .prompt_dump_dir
             .clone()
@@ -177,44 +235,7 @@ impl AionrsAgentManager {
                 runtime_env: config_extra.runtime_env.clone(),
             });
 
-        let cli_args = CliArgs {
-            provider: Some(config_extra.provider.clone()),
-            api_key: Some(config_extra.api_key.clone()),
-            base_url: config_extra.base_url.clone(),
-            model: Some(config_extra.model.clone()),
-            max_tokens: None,
-            max_turns: config_extra.max_turns,
-            max_tool_call_malformed_turns: config_extra.max_tool_call_malformed_turns,
-            max_tool_call_failure_turns: config_extra.max_tool_call_failure_turns,
-            system_prompt: config_extra.system_prompt.clone(),
-            profile: None,
-            auto_approve: config_extra.session_mode.as_deref() == Some("yolo"),
-            thinking: None,
-            thinking_budget: None,
-            project_dir: Some(PathBuf::from(&workspace)),
-        };
-
-        let mut config = resolve_aionui_config(&cli_args)?;
-
-        // Backend-specific overrides
-        config.bedrock = config_extra.bedrock_config;
-        config.session.enabled = true;
-        config.session.directory = config_extra.session_directory.to_string_lossy().into_owned();
-        config.compat.image_input = Some(image_input_capability);
-
-        if let Some(mode) = config_extra.compat_overrides.openai_api_mode {
-            config.compat.transport.openai_api_mode = Some(mode);
-        }
-        if let Some(field) = config_extra.compat_overrides.max_tokens_field {
-            config.compat.transport.max_tokens_field = Some(field);
-        }
-        if let Some(path) = config_extra.compat_overrides.api_path {
-            config.compat.transport.api_path = Some(path);
-        }
-
-        if !config_extra.extra_mcp_servers.is_empty() {
-            config.mcp.servers.extend(config_extra.extra_mcp_servers.clone());
-        }
+        let config = build_aionrs_config(&workspace, &config_extra)?;
 
         let is_resume = resume_session.is_some();
         let provider_label = config.provider_label.clone();
