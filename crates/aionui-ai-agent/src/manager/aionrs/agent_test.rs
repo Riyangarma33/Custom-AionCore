@@ -400,3 +400,50 @@ fn build_aionrs_config_falls_back_to_default_for_unknown_model_without_override(
         CompactContextWindowSource::Default
     );
 }
+
+#[test]
+fn build_aionrs_config_resolves_prefix_stripped_heuristics_for_router_models() {
+    // ag/gemini-3.8-flash-high -> 1,048,576
+    let mut cfg_gemini = make_test_config();
+    cfg_gemini.provider = "openai".into();
+    cfg_gemini.model = "ag/gemini-3.8-flash-high".into();
+    let config_gemini = build_aionrs_config("/tmp/test-workspace", &cfg_gemini).unwrap();
+    assert_eq!(config_gemini.compact.context_window, 1_048_576);
+    assert_eq!(
+        config_gemini.compact_context_window_source,
+        CompactContextWindowSource::ModelCatalog
+    );
+
+    // cx/gpt-5.6-sol -> 372,000
+    let mut cfg_sol = make_test_config();
+    cfg_sol.provider = "openai".into();
+    cfg_sol.model = "cx/gpt-5.6-sol".into();
+    let config_sol = build_aionrs_config("/tmp/test-workspace", &cfg_sol).unwrap();
+    assert_eq!(config_sol.compact.context_window, 372_000);
+    assert_eq!(
+        config_sol.compact_context_window_source,
+        CompactContextWindowSource::ModelCatalog
+    );
+
+    // cx/gpt-5.6-terra -> 272,000
+    let mut cfg_terra = make_test_config();
+    cfg_terra.provider = "openai".into();
+    cfg_terra.model = "cx/gpt-5.6-terra".into();
+    let config_terra = build_aionrs_config("/tmp/test-workspace", &cfg_terra).unwrap();
+    assert_eq!(config_terra.compact.context_window, 272_000);
+    assert_eq!(
+        config_terra.compact_context_window_source,
+        CompactContextWindowSource::ModelCatalog
+    );
+
+    // kr/claude-sonnet-5 -> 1,000,000
+    let mut cfg_claude5 = make_test_config();
+    cfg_claude5.provider = "openai".into();
+    cfg_claude5.model = "kr/claude-sonnet-5".into();
+    let config_claude5 = build_aionrs_config("/tmp/test-workspace", &cfg_claude5).unwrap();
+    assert_eq!(config_claude5.compact.context_window, 1_000_000);
+    assert_eq!(
+        config_claude5.compact_context_window_source,
+        CompactContextWindowSource::ModelCatalog
+    );
+}

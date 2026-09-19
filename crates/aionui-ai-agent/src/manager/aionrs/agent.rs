@@ -123,6 +123,19 @@ pub(crate) fn build_aionrs_config(
             context_window = validated,
             "Applied explicit context window override from model settings"
         );
+    } else if config.compact_context_window_source == CompactContextWindowSource::Default {
+        if let Some(heuristic) =
+            crate::factory::provider_model_context::resolve_heuristic_context_window(&config_extra.model)
+        {
+            let validated = validate_context_window(heuristic, &config_extra.model);
+            config.compact.context_window = validated;
+            config.compact_context_window_source = CompactContextWindowSource::ModelCatalog;
+            info!(
+                model = %config_extra.model,
+                context_window = validated,
+                "Applied prefix-stripped heuristic context window for model"
+            );
+        }
     }
 
     if !config_extra.extra_mcp_servers.is_empty() {

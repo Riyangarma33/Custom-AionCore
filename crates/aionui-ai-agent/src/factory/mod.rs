@@ -5,6 +5,7 @@ mod acp_launch_policy;
 pub(crate) mod aionrs;
 mod antigravity;
 mod context;
+pub(crate) mod provider_model_context;
 
 use std::path::PathBuf;
 use std::sync::Arc;

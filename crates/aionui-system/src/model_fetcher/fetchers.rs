@@ -34,12 +34,35 @@ pub(crate) async fn fetch_for_platform(
 /// Response shape for OpenAI `/models` endpoint.
 #[derive(Deserialize)]
 struct OpenAiModelsResponse {
+    #[serde(default)]
     data: Vec<OpenAiModel>,
+}
+
+#[derive(Deserialize)]
+struct OpenAiModelCapabilities {
+    #[serde(rename = "contextWindow", default)]
+    context_window: Option<usize>,
+    #[serde(rename = "maxOutput", default)]
+    max_output: Option<usize>,
 }
 
 #[derive(Deserialize)]
 struct OpenAiModel {
     id: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    context_length: Option<usize>,
+    #[serde(default)]
+    max_context_tokens: Option<usize>,
+    #[serde(default)]
+    context_window: Option<usize>,
+    #[serde(default)]
+    max_completion_tokens: Option<usize>,
+    #[serde(default)]
+    max_output_tokens: Option<usize>,
+    #[serde(default)]
+    capabilities: Option<OpenAiModelCapabilities>,
 }
 
 /// Fetch models from an OpenAI-compatible `/models` endpoint.
@@ -49,13 +72,12 @@ pub(super) async fn fetch_openai_compatible(
     api_key: &str,
 ) -> Result<Vec<ModelInfo>, SystemError> {
     let url = format!("{}/models", base_url.trim_end_matches('/'));
-    let resp = client
-        .get(&url)
-        .header("Authorization", format!("Bearer {api_key}"))
-        .timeout(REQUEST_TIMEOUT)
-        .send()
-        .await
-        .map_err(|e| remote_error(&e))?;
+    let first_key = api_key.lines().next().unwrap_or(api_key).trim();
+    let mut req = client.get(&url).timeout(REQUEST_TIMEOUT);
+    if !first_key.is_empty() {
+        req = req.header("Authorization", format!("Bearer {first_key}"));
+    }
+    let resp = req.send().await.map_err(|e| remote_error(&e))?;
 
     check_response_status(&resp)?;
 
@@ -64,7 +86,32 @@ pub(super) async fn fetch_openai_compatible(
         .await
         .map_err(|e| SystemError::BadGateway(format!("Failed to parse models response: {e}")))?;
 
-    Ok(body.data.into_iter().map(|m| ModelInfo::Id(m.id)).collect())
+    Ok(body
+        .data
+        .into_iter()
+        .map(|m| {
+            let context_length = m
+                .context_length
+                .or(m.context_window)
+                .or(m.max_context_tokens)
+                .or_else(|| m.capabilities.as_ref().and_then(|c| c.context_window));
+            let max_completion_tokens = m
+                .max_completion_tokens
+                .or(m.max_output_tokens)
+                .or_else(|| m.capabilities.as_ref().and_then(|c| c.max_output));
+
+            if context_length.is_some() || max_completion_tokens.is_some() || m.name.is_some() {
+                ModelInfo::Named {
+                    id: m.id,
+                    name: m.name,
+                    context_length,
+                    max_completion_tokens,
+                }
+            } else {
+                ModelInfo::Id(m.id)
+            }
+        })
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -389,5 +436,51 @@ mod tests {
         let models = fallback_models(&["a", "b", "c"]);
         assert_eq!(models.len(), 3);
         assert_eq!(models[0], ModelInfo::Id("a".into()));
+    }
+
+    #[test]
+    fn openai_models_response_deserializes_context_length_and_capabilities() {
+        let raw = serde_json::json!({
+            "data": [
+                {
+                    "id": "ag/gemini-3.8-flash-high",
+                    "context_length": 1048576,
+                    "max_completion_tokens": 65536
+                },
+                {
+                    "id": "cx/gpt-5.6-sol",
+                    "capabilities": {
+                        "contextWindow": 372000,
+                        "maxOutput": 32768
+                    }
+                },
+                {
+                    "id": "simple-model"
+                }
+            ]
+        });
+
+        let parsed: OpenAiModelsResponse = serde_json::from_value(raw).unwrap();
+        assert_eq!(parsed.data.len(), 3);
+
+        let m0 = &parsed.data[0];
+        assert_eq!(m0.id, "ag/gemini-3.8-flash-high");
+        assert_eq!(m0.context_length, Some(1048576));
+        assert_eq!(m0.max_completion_tokens, Some(65536));
+
+        let m1 = &parsed.data[1];
+        assert_eq!(m1.id, "cx/gpt-5.6-sol");
+        assert_eq!(
+            m1.capabilities.as_ref().and_then(|c| c.context_window),
+            Some(372000)
+        );
+        assert_eq!(
+            m1.capabilities.as_ref().and_then(|c| c.max_output),
+            Some(32768)
+        );
+
+        let m2 = &parsed.data[2];
+        assert_eq!(m2.id, "simple-model");
+        assert_eq!(m2.context_length, None);
     }
 }

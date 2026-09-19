@@ -263,12 +263,50 @@ pub struct FetchModelsAnonymousRequest {
 }
 
 /// A model entry that can be either a bare ID string or an object with
-/// id and name.
+/// id and details (name, context_length, max_completion_tokens).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum ModelInfo {
     Id(String),
-    Named { id: String, name: String },
+    Named {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context_length: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_completion_tokens: Option<usize>,
+    },
+}
+
+impl ModelInfo {
+    pub fn id(&self) -> &str {
+        match self {
+            ModelInfo::Id(id) => id,
+            ModelInfo::Named { id, .. } => id,
+        }
+    }
+
+    pub fn name(&self) -> Option<&str> {
+        match self {
+            ModelInfo::Id(_) => None,
+            ModelInfo::Named { name, .. } => name.as_deref(),
+        }
+    }
+
+    pub fn context_length(&self) -> Option<usize> {
+        match self {
+            ModelInfo::Id(_) => None,
+            ModelInfo::Named { context_length, .. } => *context_length,
+        }
+    }
+
+    pub fn max_completion_tokens(&self) -> Option<usize> {
+        match self {
+            ModelInfo::Id(_) => None,
+            ModelInfo::Named { max_completion_tokens, .. } => *max_completion_tokens,
+        }
+    }
 }
 
 /// Response for `POST /api/providers/:id/models`.
@@ -763,9 +801,38 @@ mod tests {
             info,
             ModelInfo::Named {
                 id: "gpt-4".into(),
-                name: "GPT-4".into()
+                name: Some("GPT-4".into()),
+                context_length: None,
+                max_completion_tokens: None,
             }
         );
+        assert_eq!(info.id(), "gpt-4");
+        assert_eq!(info.name(), Some("GPT-4"));
+        assert_eq!(info.context_length(), None);
+        assert_eq!(info.max_completion_tokens(), None);
+    }
+
+    #[test]
+    fn test_model_info_with_context_length() {
+        let info: ModelInfo = serde_json::from_value(json!({
+            "id": "ag/gemini-3.8-flash-high",
+            "context_length": 1048576,
+            "max_completion_tokens": 65536
+        }))
+        .unwrap();
+        assert_eq!(
+            info,
+            ModelInfo::Named {
+                id: "ag/gemini-3.8-flash-high".into(),
+                name: None,
+                context_length: Some(1048576),
+                max_completion_tokens: Some(65536),
+            }
+        );
+        assert_eq!(info.id(), "ag/gemini-3.8-flash-high");
+        assert_eq!(info.name(), None);
+        assert_eq!(info.context_length(), Some(1048576));
+        assert_eq!(info.max_completion_tokens(), Some(65536));
     }
 
     #[test]

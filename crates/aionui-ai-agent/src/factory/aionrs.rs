@@ -155,6 +155,20 @@ pub(super) async fn build(
     compat_overrides.image_input = model_overrides.image_input;
     compat_overrides.context_window = model_overrides.context_window;
 
+    // Dynamically resolve context window from provider API or heuristic if no explicit DB override
+    if compat_overrides.context_window.is_none() {
+        if let Some(dynamic_window) = crate::factory::provider_model_context::resolve_dynamic_context_window(
+            &row.platform,
+            &row.base_url,
+            &api_key,
+            &model_id,
+        )
+        .await
+        {
+            compat_overrides.context_window = Some(dynamic_window);
+        }
+    }
+
     if provider == "openai" {
         info!(
             conversation_id = %ctx.conversation_id,
