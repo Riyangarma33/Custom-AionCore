@@ -1,4 +1,4 @@
-use aionui_common::CryptoError;
+use aionui_common::{ApiError, CryptoError};
 use aionui_db::DbError;
 
 /// Crate-owned error contract for system domain services.
@@ -24,6 +24,20 @@ pub enum SystemError {
 
     #[error("Unprocessable entity: {0}")]
     UnprocessableEntity(String),
+}
+
+impl From<SystemError> for ApiError {
+    fn from(error: SystemError) -> Self {
+        match error {
+            SystemError::NotFound(reason) => ApiError::NotFound(reason),
+            SystemError::BadRequest(reason) => ApiError::BadRequest(reason),
+            SystemError::Conflict(reason) => ApiError::Conflict(reason),
+            SystemError::Internal(reason) => ApiError::Internal(reason),
+            SystemError::BadGateway(reason) => ApiError::BadGateway(reason),
+            SystemError::Timeout(reason) => ApiError::Timeout(reason),
+            SystemError::UnprocessableEntity(reason) => ApiError::UnprocessableEntity(reason),
+        }
+    }
 }
 
 impl From<DbError> for SystemError {

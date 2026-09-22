@@ -10,6 +10,7 @@ mod antigravity_hook;
 mod ask;
 mod assistant;
 mod auth;
+mod aws;
 mod channel;
 mod chat_file;
 mod confirmation;
@@ -81,6 +82,11 @@ pub use auth::{
     LoginResponse, PublicUser, QrLoginRequest, RefreshResponse, RefreshTokenRequest, RevokeExternalSessionRequest,
     RevokeExternalSessionResponse, UserInfoResponse, WebuiChangePasswordRequest, WebuiChangeUsernameRequest,
     WebuiChangeUsernameResponse, WebuiGenerateQrTokenResponse, WebuiResetPasswordResponse, WsTokenResponse,
+};
+pub use aws::{
+    AwsCallerIdentity, AwsDeleteProfileRequest, AwsJobState, AwsLoginJobStatus, AwsLoginRequest,
+    AwsProfileAuthMethod, AwsProfileSummary, AwsRuntimeInfo, AwsSaveProfileRequest, AwsSaveSsoSessionRequest,
+    AwsSsoSessionSummary, AwsSubmitCodeRequest, AwsTestIdentityRequest, AwsTestIdentityResponse,
 };
 pub use channel::{
     ApprovePairingRequest, BridgeResponse, ChannelAssistantSettingRequest, ChannelAssistantSettingResponse,

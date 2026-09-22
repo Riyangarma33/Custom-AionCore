@@ -39,7 +39,7 @@ use aionui_project::project_routes;
 use aionui_realtime::{NoopMessageRouter, WebSocketManager, WsHandlerState, ws_upgrade_handler};
 use aionui_shell::shell_routes;
 use aionui_sidebar::sidebar_routes;
-use aionui_system::{ClientPrefService, connection_test_routes, system_routes};
+use aionui_system::{ClientPrefService, aws_routes, connection_test_routes, system_routes};
 use aionui_team::{TeamSessionService, team_routes};
 
 use crate::services::AppServices;
@@ -299,6 +299,10 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     let connection_test_authenticated = connection_test_routes(states.connection_test)
         .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
+    // AWS CLI manager routes protected by auth middleware
+    let aws_authenticated =
+        aws_routes(states.aws).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+
     // File routes protected by auth middleware
     let file_authenticated =
         file_routes(states.file).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
@@ -405,6 +409,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         .merge(remote_agent_authenticated)
         .merge(agent_authenticated)
         .merge(connection_test_authenticated)
+        .merge(aws_authenticated)
         .merge(file_authenticated)
         .merge(project_authenticated)
         .merge(sidebar_authenticated)

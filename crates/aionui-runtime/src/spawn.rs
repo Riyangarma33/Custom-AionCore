@@ -68,6 +68,40 @@ pub async fn kill_process_tree(child: &mut Child) -> io::Result<()> {
     child.wait().await.map(|_| ())
 }
 
+/// Check if a process with the given PID is currently alive.
+pub fn is_pid_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        let res = unsafe { libc::kill(pid as i32, 0) };
+        if res == 0 {
+            return true;
+        }
+        let err = io::Error::last_os_error();
+        err.raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+/// Force-kill a process tree identified by PID.
+pub async fn kill_pid_tree(pid: u32) -> io::Result<()> {
+    if pid == 0 {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    force_kill_process_tree(pid, Some(pid))?;
+    #[cfg(windows)]
+    kill_windows_process_tree(pid).await?;
+    #[cfg(not(any(unix, windows)))]
+    let _ = pid;
+    Ok(())
+}
+
 impl std::fmt::Debug for Builder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Builder")

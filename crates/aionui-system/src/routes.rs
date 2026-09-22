@@ -18,7 +18,6 @@ use aionui_common::ApiError;
 
 use crate::client_pref::ClientPrefService;
 use crate::diagnostics::FeedbackDiagnosticsService;
-use crate::error::SystemError;
 use crate::model_fetcher::ModelFetchService;
 use crate::protocol::ProtocolDetectionService;
 use crate::provider::ProviderService;
@@ -37,20 +36,6 @@ pub struct SystemRouterState {
     pub version_check_service: VersionCheckService,
     pub runtime_prepare_service: RuntimePrepareService,
     pub feedback_diagnostics_service: FeedbackDiagnosticsService,
-}
-
-impl From<SystemError> for ApiError {
-    fn from(error: SystemError) -> Self {
-        match error {
-            SystemError::NotFound(reason) => ApiError::NotFound(reason),
-            SystemError::BadRequest(reason) => ApiError::BadRequest(reason),
-            SystemError::Conflict(reason) => ApiError::Conflict(reason),
-            SystemError::Internal(reason) => ApiError::Internal(reason),
-            SystemError::BadGateway(reason) => ApiError::BadGateway(reason),
-            SystemError::Timeout(reason) => ApiError::Timeout(reason),
-            SystemError::UnprocessableEntity(reason) => ApiError::UnprocessableEntity(reason),
-        }
-    }
 }
 
 /// Build the system router (settings + client prefs + providers + system).

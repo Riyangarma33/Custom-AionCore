@@ -44,9 +44,9 @@ use aionui_shell::ShellRouterState;
 use aionui_sidebar::{ArchiveTeardownPorts, SidebarRouterState, SidebarService};
 use aionui_skill_runtime::{SkillRuntimeRouterState, SkillRuntimeService};
 use aionui_system::{
-    ClientPrefService, ConnectionTestRouterState, ConnectionTestService, FeedbackDiagnosticsService, ModelFetchService,
-    ProtocolDetectionService, ProviderService, RuntimePrepareService, SettingsService, SystemRouterState,
-    VersionCheckService,
+    AwsManagerService, AwsRouterState, ClientPrefService, ConnectionTestRouterState, ConnectionTestService,
+    FeedbackDiagnosticsService, ModelFetchService, ProtocolDetectionService, ProviderService,
+    RuntimePrepareService, SettingsService, SystemRouterState, VersionCheckService,
 };
 use aionui_team::{
     AgentTurnCancellationPort, AgentTurnExecutionPort, NativeSlashCommandPort, TeamAssistantCatalogEntry,
@@ -134,6 +134,7 @@ pub struct ModuleStates {
     pub agent: AgentRouterState,
 
     pub connection_test: ConnectionTestRouterState,
+    pub aws: AwsRouterState,
     pub file: FileRouterState,
     pub project: ProjectRouterState,
     pub sidebar: SidebarRouterState,
@@ -312,6 +313,7 @@ pub async fn build_module_states(
             service: agent_service,
         }),
         connection_test: build_module_state_phase(&boot, "connection_test", build_connection_test_state),
+        aws: build_module_state_phase(&boot, "aws", || build_aws_state(services)),
         file: build_module_state_phase(&boot, "file", || build_file_state(services))?,
         project: build_module_state_phase(&boot, "project", || build_project_state(services)),
         sidebar: build_module_state_phase(&boot, "sidebar", || build_sidebar_state(services)),
@@ -537,6 +539,13 @@ pub fn build_remote_agent_state(services: &AppServices) -> RemoteAgentRouterStat
 pub fn build_connection_test_state() -> ConnectionTestRouterState {
     ConnectionTestRouterState {
         service: ConnectionTestService::new(reqwest::Client::new()),
+    }
+}
+
+/// Build the default `AwsRouterState` from application services.
+pub fn build_aws_state(services: &AppServices) -> AwsRouterState {
+    AwsRouterState {
+        service: Arc::new(AwsManagerService::new(services.work_dir.clone())),
     }
 }
 

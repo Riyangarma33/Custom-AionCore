@@ -1,6 +1,7 @@
 #![warn(clippy::disallowed_types)]
 
 //! System services: provider management, model fetching, settings, and version checks.
+pub mod aws_manager;
 pub mod bedrock_probe;
 pub mod client_pref;
 pub mod diagnostics;
@@ -15,6 +16,7 @@ pub mod settings;
 pub mod sysinfo;
 pub mod version;
 
+pub use aws_manager::{AwsManagerService, AwsRouterState, aws_routes};
 pub use bedrock_probe::{ConnectionTestRouterState, ConnectionTestService, connection_test_routes};
 pub use client_pref::ClientPrefService;
 pub use diagnostics::FeedbackDiagnosticsService;

@@ -22,6 +22,9 @@ aws-config.workspace = true
 aws-sdk-bedrock.workspace = true
 semver.workspace = true
 dirs.workspace = true
+regex.workspace = true
+uuid.workspace = true
+chrono.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_System_Power"] }
