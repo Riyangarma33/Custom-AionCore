@@ -25,6 +25,9 @@ fn repository(is_worktree: bool, worktree_of: Option<&str>) -> ScmRepository {
         head: None,
         is_worktree,
         worktree_of: worktree_of.map(str::to_owned),
+        is_submodule: false,
+        submodule_of: None,
+        gitlink_diverged: false,
         capabilities: ScmCapabilities {
             staging: true,
             local_branches: true,
@@ -51,6 +54,21 @@ fn repository_frame_omits_worktree_fields_by_default() {
     let value = serde_json::to_value(repository(false, None)).expect("serialize");
     assert!(value.get("is_worktree").is_none(), "false is_worktree is omitted");
     assert!(value.get("worktree_of").is_none(), "None worktree_of is omitted");
+    assert!(value.get("is_submodule").is_none(), "false is_submodule is omitted");
+    assert!(value.get("submodule_of").is_none(), "None submodule_of is omitted");
+    assert!(value.get("gitlink_diverged").is_none(), "false gitlink_diverged is omitted");
+}
+
+#[test]
+fn repository_frame_carries_submodule_ownership_and_divergence() {
+    let mut repo = repository(false, None);
+    repo.is_submodule = true;
+    repo.submodule_of = Some("scm:ws".into());
+    repo.gitlink_diverged = true;
+    let value = serde_json::to_value(repo).expect("serialize");
+    assert_eq!(value["is_submodule"], true);
+    assert_eq!(value["submodule_of"], "scm:ws");
+    assert_eq!(value["gitlink_diverged"], true);
 }
 
 /// Build the notification a status broadcast puts on the wire, so the assertions

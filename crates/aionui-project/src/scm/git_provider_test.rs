@@ -2665,3 +2665,269 @@ fn repo_id_folds_relative_path_for_child_repositories() {
         "the same child always yields the same repo id"
     );
 }
+
+fn add_submodule_repo(parent: &Repository, name: &str, child_url: &str) -> Repository {
+    let sub_path = Path::new(name);
+    let mut sub = parent.submodule(child_url, sub_path, true).expect("submodule add");
+    let child_repo = sub.clone(None).expect("submodule clone");
+    sub.add_to_index(true).expect("add to index");
+    sub.add_finalize().expect("add finalize");
+    child_repo
+}
+
+#[tokio::test]
+async fn parent_status_remains_clean_when_submodule_has_dirty_working_tree() {
+    let tmp = TempDir::new().expect("tempdir");
+    let parent_repo = init_committed_repo(tmp.path());
+    let remote_dir = TempDir::new().expect("remote tempdir");
+    let _remote_repo = init_committed_repo(remote_dir.path());
+
+    let child_repo = add_submodule_repo(&parent_repo, "sub1", remote_dir.path().to_str().unwrap());
+    commit_all(&parent_repo, "add submodule sub1");
+
+    // Dirty working tree in child submodule only
+    write(child_repo.workdir().unwrap(), "dirty.txt", "untracked file\n");
+    write(child_repo.workdir().unwrap(), "a.txt", "modified in submodule\n");
+
+    let provider = GitScmProvider::new();
+    let root = root_at("pe1", tmp.path(), "parent");
+    let repos = provider.discover(&root).await.expect("discover ok");
+    assert_eq!(repos.len(), 2, "parent and submodule are surfaced");
+
+    let parent_ref = RepoRef {
+        repo_id: "scm:pe1".to_owned(),
+    };
+    let parent_status = provider.status(&parent_ref).await.expect("status ok");
+    assert!(
+        parent_status.resources.is_empty(),
+        "parent repo status remains clean when submodule working tree is dirty: {:?}",
+        parent_status.resources
+    );
+
+    let child_ref = RepoRef {
+        repo_id: "scm:pe1/sub1".to_owned(),
+    };
+    let child_status = provider.status(&child_ref).await.expect("child status ok");
+    assert_eq!(
+        child_status.resources.len(),
+        2,
+        "child repo reports its own working tree dirtiness: {:?}",
+        child_status.resources
+    );
+}
+
+#[tokio::test]
+async fn parent_status_reports_change_when_submodule_commit_diverges() {
+    let tmp = TempDir::new().expect("tempdir");
+    let parent_repo = init_committed_repo(tmp.path());
+    let remote_dir = TempDir::new().expect("remote tempdir");
+    let _remote_repo = init_committed_repo(remote_dir.path());
+
+    let child_repo = add_submodule_repo(&parent_repo, "sub1", remote_dir.path().to_str().unwrap());
+    commit_all(&parent_repo, "add submodule sub1");
+
+    // Make a new commit inside the submodule
+    write(child_repo.workdir().unwrap(), "b.txt", "new committed file\n");
+    commit_all(&child_repo, "submodule commit 2");
+
+    let provider = GitScmProvider::new();
+    let root = root_at("pe1", tmp.path(), "parent");
+    let repos = provider.discover(&root).await.expect("discover ok");
+
+    let child = repos.iter().find(|r| r.root.relative_path == "sub1").expect("child repo");
+    assert!(child.is_submodule, "child is marked as a submodule");
+    assert_eq!(child.submodule_of.as_deref(), Some("scm:pe1"));
+    assert!(child.gitlink_diverged, "child gitlink divergence is detected");
+
+    let parent_ref = RepoRef {
+        repo_id: "scm:pe1".to_owned(),
+    };
+    let parent_status = provider.status(&parent_ref).await.expect("status ok");
+    assert_eq!(
+        parent_status.resources.len(),
+        1,
+        "parent reports submodule gitlink divergence: {:?}",
+        parent_status.resources
+    );
+    assert_eq!(parent_status.resources[0].repo_relative_path, "sub1");
+    assert_eq!(parent_status.resources[0].state, ScmResourceState::Modified);
+
+    // Diff on the diverged gitlink produces valid subproject commit patch
+    let diff = provider
+        .diff(
+            &parent_ref,
+            &parent_status.resources[0].file,
+            ContentRef::Committed,
+            ContentRef::Working,
+        )
+        .await
+        .expect("diff ok");
+    assert!(diff.patch.is_some(), "diff produced patch");
+    assert!(
+        diff.patch.as_ref().unwrap().contains("Subproject commit"),
+        "patch contains Subproject commit diff: {:?}",
+        diff.patch
+    );
+}
+
+#[tokio::test]
+async fn surfaces_initialized_submodule_and_skips_uninitialized_and_corrupted() {
+    let tmp = TempDir::new().expect("tempdir");
+    let parent_repo = init_committed_repo(tmp.path());
+    let remote_dir = TempDir::new().expect("remote tempdir");
+    let _remote_repo = init_committed_repo(remote_dir.path());
+
+    // 1) Initialized submodule
+    let _child_repo = add_submodule_repo(&parent_repo, "sub_ok", remote_dir.path().to_str().unwrap());
+
+    // 2) Uninitialized submodule: registered in .gitmodules but not cloned
+    parent_repo
+        .submodule(
+            "https://example.com/uninit.git",
+            Path::new("sub_uninit"),
+            true,
+        )
+        .expect("submodule uninit add");
+
+    // 3) Corrupted submodule: registered in .gitmodules, .git/modules present, but workdir missing/broken
+    parent_repo
+        .submodule(
+            "https://example.com/corrupt.git",
+            Path::new("sub_corrupt"),
+            true,
+        )
+        .expect("submodule corrupt add");
+    std::fs::create_dir_all(tmp.path().join(".git/modules/sub_corrupt")).expect("mkdir modules corrupt");
+
+    commit_all(&parent_repo, "add submodules");
+
+    let provider = GitScmProvider::new();
+    let root = root_at("pe1", tmp.path(), "parent");
+    let repos = provider.discover(&root).await.expect("discover ok");
+
+    let names: Vec<String> = repos.iter().map(|r| r.root.relative_path.clone()).collect();
+    assert_eq!(
+        names,
+        vec!["".to_owned(), "sub_ok".to_owned()],
+        "only the root and initialized submodule surface, uninit and corrupted are skipped"
+    );
+}
+
+#[tokio::test]
+async fn surfaces_nested_submodules_at_all_three_levels() {
+    let tmp = TempDir::new().expect("tempdir");
+    let parent_repo = init_committed_repo(tmp.path());
+
+    let level1_remote = TempDir::new().expect("level1 remote");
+    let level1_repo = init_committed_repo(level1_remote.path());
+
+    let level2_remote = TempDir::new().expect("level2 remote");
+    let _level2_repo = init_committed_repo(level2_remote.path());
+
+    // In level1: add nested submodule
+    let _sub2_repo = add_submodule_repo(&level1_repo, "nested", level2_remote.path().to_str().unwrap());
+    commit_all(&level1_repo, "add nested submodule");
+
+    // In parent: add level1 submodule
+    let _sub1_repo = add_submodule_repo(&parent_repo, "child", level1_remote.path().to_str().unwrap());
+    commit_all(&parent_repo, "add child submodule");
+
+    let provider = GitScmProvider::new();
+    let root = root_at("pe1", tmp.path(), "parent");
+    let repos = provider.discover(&root).await.expect("discover ok");
+
+    let rel_paths: Vec<String> = repos.iter().map(|r| r.root.relative_path.clone()).collect();
+    assert_eq!(
+        rel_paths,
+        vec!["".to_owned(), "child".to_owned(), "child/nested".to_owned()],
+        "all 3 levels are surfaced"
+    );
+
+    let child = repos.iter().find(|r| r.root.relative_path == "child").unwrap();
+    assert!(child.is_submodule);
+    assert_eq!(child.submodule_of.as_deref(), Some("scm:pe1"));
+
+    let nested = repos.iter().find(|r| r.root.relative_path == "child/nested").unwrap();
+    assert!(nested.is_submodule);
+    assert_eq!(nested.submodule_of.as_deref(), Some("scm:pe1/child"));
+}
+
+#[tokio::test]
+async fn nested_submodule_file_diff_stage_and_discard() {
+    let tmp = TempDir::new().expect("tempdir");
+    let parent_repo = init_committed_repo(tmp.path());
+
+    let level1_remote = TempDir::new().expect("level1 remote");
+    let level1_repo = init_committed_repo(level1_remote.path());
+
+    let level2_remote = TempDir::new().expect("level2 remote");
+    let _level2_repo = init_committed_repo(level2_remote.path());
+
+    let _sub2_repo = add_submodule_repo(&level1_repo, "nested", level2_remote.path().to_str().unwrap());
+    commit_all(&level1_repo, "add nested submodule");
+
+    let _sub1_repo = add_submodule_repo(&parent_repo, "child", level1_remote.path().to_str().unwrap());
+    commit_all(&parent_repo, "add child submodule");
+
+    let provider = GitScmProvider::new();
+    let root = root_at("pe1", tmp.path(), "parent");
+    let repos = provider.discover(&root).await.expect("discover ok");
+
+    let nested_repo_info = repos.iter().find(|r| r.root.relative_path == "child/nested").unwrap();
+    let nested_ref = RepoRef {
+        repo_id: nested_repo_info.repo_id.clone(),
+    };
+
+    // Edit a file in the nested submodule
+    let file_path = tmp.path().join("child/nested/a.txt");
+    write(&tmp.path().join("child/nested"), "a.txt", "modified content\n");
+
+    let status = provider.status(&nested_ref).await.expect("status ok");
+    assert_eq!(status.resources.len(), 1);
+    assert_eq!(status.resources[0].repo_relative_path, "a.txt");
+
+    // Test diff with PE-relative path as sent from runtime/client
+    let pe_relative_file = FileRef {
+        pe_id: "pe1".to_owned(),
+        relative_path: "child/nested/a.txt".to_owned(),
+    };
+    let diff = provider
+        .diff(&nested_ref, &pe_relative_file, ContentRef::Committed, ContentRef::Working)
+        .await
+        .expect("diff ok");
+    assert!(diff.patch.is_some());
+    assert!(diff.patch.as_ref().unwrap().contains("+modified content"));
+
+    // Test stage with PE-relative path
+    let staging = provider.staging().expect("staging");
+    let stage_outcome = staging
+        .stage(&nested_ref, &[pe_relative_file.clone()])
+        .await
+        .expect("stage ok");
+    assert!(stage_outcome.is_complete());
+
+    let status_after_stage = provider.status(&nested_ref).await.expect("status ok");
+    assert!(status_after_stage.resources[0].staged == Some(true));
+
+    // Test unstage
+    let unstage_outcome = staging
+        .unstage(&nested_ref, &[pe_relative_file.clone()])
+        .await
+        .expect("unstage ok");
+    assert!(unstage_outcome.is_complete());
+
+    // Test revert/discard
+    let revert_outcome = provider
+        .revert(&nested_ref, &[pe_relative_file.clone()])
+        .await
+        .expect("revert ok");
+    assert!(revert_outcome.is_complete());
+
+    let status_after_revert = provider.status(&nested_ref).await.expect("status ok");
+    assert!(status_after_revert.resources.is_empty(), "clean after revert");
+    assert_eq!(
+        std::fs::read_to_string(&file_path).expect("read"),
+        "hello\n",
+        "file content reverted to committed content"
+    );
+}

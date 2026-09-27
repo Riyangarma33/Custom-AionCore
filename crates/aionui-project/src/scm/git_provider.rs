@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use git2::{Delta, DiffOptions, ErrorClass, ErrorCode, Repository, Status, StatusOptions, StatusShow};
+use git2::{Delta, DiffOptions, ErrorClass, ErrorCode, Repository, Status, StatusOptions, StatusShow, SubmoduleIgnore};
 
 use super::error::ScmError;
 use super::provider::{IScmProvider, IScmStaging};
@@ -59,6 +59,8 @@ struct RepoEntry {
     /// `.git` entry beside the work tree is a file pointing elsewhere, so this is
     /// what a metadata watch must be armed on.
     git_dir: PathBuf,
+    /// Path relative to the PE root ("" for root repo itself).
+    pe_relative_path: String,
 }
 
 /// git source-control provider.
@@ -73,6 +75,18 @@ pub struct GitScmProvider {
 impl GitScmProvider {
     pub fn new() -> Self {
         Self::with_trash(Arc::new(PlatformTrash))
+    }
+
+    /// Re-anchor a path passed by the caller (which may be PE-relative) to this
+    /// repository's own worktree root.
+    fn repo_relative<'a>(&self, entry: &RepoEntry, path: &'a str) -> &'a str {
+        if entry.pe_relative_path.is_empty() {
+            path
+        } else if let Some(stripped) = path.strip_prefix(&entry.pe_relative_path) {
+            stripped.strip_prefix('/').unwrap_or(stripped)
+        } else {
+            path
+        }
     }
 
     /// Build with a specific trash sink. Crate-internal: the outward contract
@@ -227,6 +241,9 @@ struct OpenedRepo {
     /// this is its primary repository's git dir, otherwise it equals `git_dir`.
     common_dir: PathBuf,
     is_worktree: bool,
+    is_submodule: bool,
+    parent_workdir: Option<PathBuf>,
+    gitlink_diverged: bool,
     head: Option<ScmHead>,
 }
 
@@ -248,6 +265,9 @@ fn open_repo(path: &Path, relative_path: String) -> Result<Option<OpenedRepo>, g
                 git_dir: repo.path().to_path_buf(),
                 common_dir: repo.commondir().to_path_buf(),
                 is_worktree: repo.is_worktree(),
+                is_submodule: false,
+                parent_workdir: None,
+                gitlink_diverged: false,
                 head: read_head(&repo),
             }))
         }
@@ -406,6 +426,126 @@ fn enumerate_linked_worktrees(repo_path: &Path, pe_root_key: &Path) -> Vec<Opene
     out
 }
 
+/// Recursively enumerate git submodules belonging to `repo` that live inside
+/// `pe_root_key`.
+///
+/// Implements a three-state initialization check:
+///  (a) Uninitialized / not cloned: skipped with a debug trace.
+///  (b) Cloned and valid: surfaced, and recursed into for nested submodules.
+///  (c) Metadata present but worktree corrupted / missing: skipped with a warning trace.
+///
+/// Prevents recursive loops via `visited` (set of canonical worktree paths).
+fn enumerate_submodules(
+    repo: &Repository,
+    pe_root_key: &Path,
+    visited: &mut std::collections::HashSet<PathBuf>,
+) -> Vec<OpenedRepo> {
+    let Some(workdir) = repo.workdir() else {
+        return vec![];
+    };
+    let submodules = match repo.submodules() {
+        Ok(s) => s,
+        Err(err) => {
+            tracing::debug!(error = %err, "scm discover: repo submodules list failed, skipping");
+            return vec![];
+        }
+    };
+
+    let mut out = vec![];
+    let parent_workdir = workdir.to_path_buf();
+    let git_modules_dir = repo.path().join("modules");
+
+    for sub in submodules {
+        let sub_path = sub.path();
+        let sub_workdir = workdir.join(sub_path);
+        let Some(relative_path) = pe_relative_path(pe_root_key, &sub_workdir) else {
+            tracing::debug!(
+                ?sub_workdir,
+                "scm discover: submodule lives outside the pe root, not surfaced"
+            );
+            continue;
+        };
+
+        let sub_workdir_key = canonical_key(&sub_workdir);
+        if !visited.insert(sub_workdir_key) {
+            tracing::debug!(?sub_workdir, "scm discover: submodule already visited, cycle prevented");
+            continue;
+        }
+
+        let sub_name = sub.name().unwrap_or_default();
+        let metadata_exists = git_modules_dir.join(sub_name).exists() || git_modules_dir.join(sub_path).exists();
+        let dot_git_exists = sub_workdir.join(".git").exists();
+
+        let opened_sub_repo = sub.open().or_else(|_| Repository::open(&sub_workdir));
+        match opened_sub_repo {
+            Ok(sub_repo) if sub_workdir.is_dir() && sub_repo.workdir().is_some() => {
+                let sub_head_commit = sub_repo.head().ok().and_then(|h| h.target());
+                let gitlink_diverged = if let Some(sub_head) = sub_head_commit {
+                    if let Some(parent_head_oid) = sub.head_id() {
+                        sub_head != parent_head_oid
+                    } else if let Some(parent_index_oid) = sub.index_id() {
+                        sub_head != parent_index_oid
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+
+                let opened = OpenedRepo {
+                    relative_path,
+                    workdir: sub_workdir.clone(),
+                    git_dir: sub_repo.path().to_path_buf(),
+                    common_dir: sub_repo.commondir().to_path_buf(),
+                    is_worktree: sub_repo.is_worktree(),
+                    is_submodule: true,
+                    parent_workdir: Some(parent_workdir.clone()),
+                    gitlink_diverged,
+                    head: read_head(&sub_repo),
+                };
+
+                // Recurse into nested submodules
+                let nested = enumerate_submodules(&sub_repo, pe_root_key, visited);
+                out.push(opened);
+                out.extend(nested);
+            }
+            Ok(_) => {
+                if metadata_exists || dot_git_exists {
+                    tracing::warn!(
+                        submodule = %sub_name,
+                        path = ?sub_workdir,
+                        "scm discover: submodule git metadata present but working tree is missing or not a directory (corrupted checkout), skipping"
+                    );
+                } else {
+                    tracing::debug!(
+                        submodule = %sub_name,
+                        path = ?sub_workdir,
+                        "scm discover: submodule not cloned/initialized, skipping"
+                    );
+                }
+            }
+            Err(err) => {
+                if metadata_exists || dot_git_exists {
+                    tracing::warn!(
+                        submodule = %sub_name,
+                        path = ?sub_workdir,
+                        error = %err,
+                        "scm discover: submodule git metadata present but repository open failed (corrupted checkout), skipping"
+                    );
+                } else {
+                    tracing::debug!(
+                        submodule = %sub_name,
+                        path = ?sub_workdir,
+                        "scm discover: submodule not cloned/initialized, skipping"
+                    );
+                }
+            }
+        }
+    }
+
+    out
+}
+
 /// Drop repeated repositories by canonicalized work-tree path, keeping the first.
 ///
 /// A linked worktree can be reached two ways in one discovery — enumerated from
@@ -492,6 +632,23 @@ fn collect_status(repo: &Repository) -> Result<(Vec<ScmResource>, bool, bool, Op
             tracing::warn!("scm status: skipping entry with non-UTF-8 path");
             continue;
         };
+
+        // Suppress submodule working-tree dirtiness from polluting parent change list,
+        // while preserving gitlink-SHA divergence (see Phase 3.7a).
+        if let Ok(sm) = repo.find_submodule(path) {
+            let sm_name = sm.name().unwrap_or(path);
+            if let Ok(sm_status) = repo.submodule_status(sm_name, SubmoduleIgnore::Dirty) {
+                let is_gitlink_changed = sm_status.is_index_added()
+                    || sm_status.is_index_deleted()
+                    || sm_status.is_index_modified()
+                    || sm_status.is_wd_added()
+                    || sm_status.is_wd_deleted()
+                    || sm_status.is_wd_modified();
+                if !is_gitlink_changed {
+                    continue;
+                }
+            }
+        }
         // The wire contract says `relative_path` is `/`-separated, and libgit2
         // stores repo paths that way on every platform (it converts `\` to `/` on
         // input, see git2's `path_to_repo_path`). So this is reported, not
@@ -589,7 +746,17 @@ fn read_at(repo: &Repository, rel: &str, at: ContentRef) -> Result<Option<Vec<u8
                     message: "bare repository has no work tree".to_owned(),
                 });
             };
-            match std::fs::read(workdir.join(path)) {
+            let full_path = workdir.join(path);
+            if full_path.is_dir() {
+                // If it is a directory (such as a submodule), read its HEAD commit SHA.
+                if let Ok(sub_repo) = Repository::open(&full_path) {
+                    if let Ok(head) = sub_repo.head().and_then(|h| h.peel(git2::ObjectType::Commit)) {
+                        return Ok(Some(format!("Subproject commit {}\n", head.id()).into_bytes()));
+                    }
+                }
+                return Ok(None);
+            }
+            match std::fs::read(&full_path) {
                 Ok(bytes) => Ok(Some(bytes)),
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
                 Err(err) => Err(ScmError::Io {
@@ -601,6 +768,9 @@ fn read_at(repo: &Repository, rel: &str, at: ContentRef) -> Result<Option<Vec<u8
         ContentRef::Staged => {
             let index = repo.index().map_err(|e| engine_error("original", &e))?;
             if let Some(entry) = index.get_path(path, 0) {
+                if entry.mode == 0o160000 {
+                    return Ok(Some(format!("Subproject commit {}\n", entry.id).into_bytes()));
+                }
                 let blob = repo.find_blob(entry.id).map_err(|e| engine_error("original", &e))?;
                 return Ok(Some(blob.content().to_vec()));
             }
@@ -631,6 +801,9 @@ fn read_at(repo: &Repository, rel: &str, at: ContentRef) -> Result<Option<Vec<u8
             let tree = head.peel_to_tree().map_err(|e| engine_error("original", &e))?;
             match tree.get_path(path) {
                 Ok(entry) => {
+                    if entry.filemode() == 0o160000 {
+                        return Ok(Some(format!("Subproject commit {}\n", entry.id()).into_bytes()));
+                    }
                     let blob = repo.find_blob(entry.id()).map_err(|e| engine_error("original", &e))?;
                     Ok(Some(blob.content().to_vec()))
                 }
@@ -978,6 +1151,23 @@ impl IScmProvider for GitScmProvider {
             // A worktree can be both enumerated and (in the container case) walked
             // as a child; surface it once.
             dedup_by_workdir(&mut opened);
+
+            // Submodule discovery: recursively enumerate submodules from all surfaced repos
+            let mut submodules = vec![];
+            let mut visited = std::collections::HashSet::new();
+            for repo in &opened {
+                visited.insert(canonical_key(&repo.workdir));
+            }
+            for repo in &opened {
+                if repo.is_worktree {
+                    continue;
+                }
+                if let Ok(r) = Repository::open(&repo.workdir) {
+                    submodules.extend(enumerate_submodules(&r, &pe_root_key, &mut visited));
+                }
+            }
+            opened.extend(submodules);
+            dedup_by_workdir(&mut opened);
             Ok(opened)
         })
         .await
@@ -1004,6 +1194,18 @@ impl IScmProvider for GitScmProvider {
             })
             .collect();
 
+        // Index surfaced repositories by their canonical workdir so submodules can
+        // resolve their parent repository's repo_id.
+        let workdir_to_repo_id: HashMap<PathBuf, String> = opened
+            .iter()
+            .map(|o| {
+                (
+                    canonical_key(&o.workdir),
+                    Self::repo_id_for(&root.pe_id, &o.relative_path),
+                )
+            })
+            .collect();
+
         let caps = self.capabilities();
         let mut repos = Vec::with_capacity(opened.len());
         for o in opened {
@@ -1015,12 +1217,21 @@ impl IScmProvider for GitScmProvider {
             } else {
                 None
             };
+            let submodule_of = if o.is_submodule {
+                o.parent_workdir
+                    .as_ref()
+                    .and_then(|pw| workdir_to_repo_id.get(&canonical_key(pw)))
+                    .cloned()
+            } else {
+                None
+            };
 
             self.repos.write().expect("scm repo registry poisoned").insert(
                 repo_id.clone(),
                 RepoEntry {
                     workdir: o.workdir,
                     git_dir: o.git_dir,
+                    pe_relative_path: o.relative_path.clone(),
                 },
             );
 
@@ -1047,6 +1258,9 @@ impl IScmProvider for GitScmProvider {
                 head: o.head,
                 is_worktree: o.is_worktree,
                 worktree_of,
+                is_submodule: o.is_submodule,
+                submodule_of,
+                gitlink_diverged: o.gitlink_diverged,
                 capabilities: caps,
                 state: ScmRepositoryState::Idle,
             });
@@ -1093,20 +1307,23 @@ impl IScmProvider for GitScmProvider {
         check_anchor(self.capabilities(), from)?;
         check_anchor(self.capabilities(), to)?;
         let entry = self.entry(repo)?;
-        let rel = file.relative_path.clone();
+        let rel = self.repo_relative(&entry, &file.relative_path).to_owned();
         with_repo(entry.workdir, "diff", move |r| diff_between(r, &rel, from, to)).await
     }
 
     async fn original(&self, repo: &RepoRef, file: &FileRef, at: ContentRef) -> Result<Option<Vec<u8>>, ScmError> {
         check_anchor(self.capabilities(), at)?;
         let entry = self.entry(repo)?;
-        let rel = file.relative_path.clone();
+        let rel = self.repo_relative(&entry, &file.relative_path).to_owned();
         with_repo(entry.workdir, "original", move |r| read_at(r, &rel, at)).await
     }
 
     async fn revert(&self, repo: &RepoRef, files: &[FileRef]) -> Result<ScmActionOutcome, ScmError> {
         let entry = self.entry(repo)?;
-        let rels: Vec<String> = files.iter().map(|f| f.relative_path.clone()).collect();
+        let rels: Vec<String> = files
+            .iter()
+            .map(|f| self.repo_relative(&entry, &f.relative_path).to_owned())
+            .collect();
         let trash = Arc::clone(&self.trash);
         let failed = with_repo(entry.workdir, "revert", move |r| revert_paths(r, &rels, trash.as_ref())).await?;
         outcome_of(files, failed)
@@ -1121,7 +1338,10 @@ impl IScmProvider for GitScmProvider {
 impl IScmStaging for GitScmProvider {
     async fn stage(&self, repo: &RepoRef, files: &[FileRef]) -> Result<ScmActionOutcome, ScmError> {
         let entry = self.entry(repo)?;
-        let rels: Vec<String> = files.iter().map(|f| f.relative_path.clone()).collect();
+        let rels: Vec<String> = files
+            .iter()
+            .map(|f| self.repo_relative(&entry, &f.relative_path).to_owned())
+            .collect();
 
         let failed = with_repo(entry.workdir, "stage", move |r| {
             let mut index = r.index().map_err(|e| engine_error("stage", &e))?;
@@ -1162,7 +1382,10 @@ impl IScmStaging for GitScmProvider {
 
     async fn unstage(&self, repo: &RepoRef, files: &[FileRef]) -> Result<ScmActionOutcome, ScmError> {
         let entry = self.entry(repo)?;
-        let rels: Vec<String> = files.iter().map(|f| f.relative_path.clone()).collect();
+        let rels: Vec<String> = files
+            .iter()
+            .map(|f| self.repo_relative(&entry, &f.relative_path).to_owned())
+            .collect();
 
         let failed = with_repo(entry.workdir, "unstage", move |r| {
             // Same pre-check as stage and discard: a conflicted selection is

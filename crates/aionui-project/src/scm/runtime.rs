@@ -319,14 +319,20 @@ impl ScmRuntime {
         let _guard = lock.lock().await;
 
         let pe_id = self.pe_id_of(repo).await?;
+        let repo_rel = self.repo_rel_path_of(repo).await?;
         let mut status = self.provider.status(repo).await?;
 
         // Identity is assembled here, not in the provider: the provider knows
         // repository-relative paths, the pe identity comes from the resolved root.
         for resource in &mut status.resources {
+            let rel = if repo_rel.is_empty() {
+                resource.repo_relative_path.clone()
+            } else {
+                format!("{repo_rel}/{}", resource.repo_relative_path)
+            };
             resource.file = FileRef {
                 pe_id: pe_id.clone(),
-                relative_path: resource.repo_relative_path.clone(),
+                relative_path: rel,
             };
         }
 
@@ -411,6 +417,17 @@ impl ScmRuntime {
             .await
             .get(&repo.repo_id)
             .map(|state| state.repository.root.pe_id.clone())
+            .ok_or_else(|| ScmError::UnknownRepository {
+                repo_id: repo.repo_id.clone(),
+            })
+    }
+
+    async fn repo_rel_path_of(&self, repo: &RepoRef) -> Result<String, ScmError> {
+        self.repos
+            .read()
+            .await
+            .get(&repo.repo_id)
+            .map(|state| state.repository.root.relative_path.clone())
             .ok_or_else(|| ScmError::UnknownRepository {
                 repo_id: repo.repo_id.clone(),
             })

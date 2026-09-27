@@ -150,6 +150,19 @@ pub struct ScmRepository {
     /// text.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worktree_of: Option<String>,
+    /// Whether this repository is a git submodule. Omitted from the wire when `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_submodule: bool,
+    /// When this is a git submodule *and* its parent repository is also in the
+    /// same project's surfaced set, the parent repository's `repo_id`. `None`
+    /// when the parent is outside the current view.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub submodule_of: Option<String>,
+    /// Whether the checked-out commit in this submodule's working tree differs
+    /// from the gitlink commit recorded in its parent repository's HEAD or index.
+    /// Omitted when `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub gitlink_diverged: bool,
     pub capabilities: ScmCapabilities,
     pub state: ScmRepositoryState,
 }
