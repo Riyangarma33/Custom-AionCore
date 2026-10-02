@@ -2662,6 +2662,33 @@ impl ConversationService {
                 "Failed to delete acp_session row on conversation delete"
             );
         }
+        if let Some(ref data_dir) = self.data_dir {
+            let aionrs_sessions_dir = data_dir.join("aionrs-sessions");
+            let raw_dir = aionrs_sessions_dir.join(id);
+            match tokio::fs::remove_dir_all(&raw_dir).await {
+                Ok(()) => {
+                    info!(
+                        conversation_id = %id,
+                        session_dir = %raw_dir.display(),
+                        "Deleted aionrs session directory on conversation delete"
+                    );
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    warn!(
+                        conversation_id = %id,
+                        session_dir = %raw_dir.display(),
+                        error = %err,
+                        "Failed to delete aionrs session directory on conversation delete"
+                    );
+                }
+            }
+            let encoded_name = encode_session_id(id);
+            if encoded_name != id {
+                let encoded_dir = aionrs_sessions_dir.join(&encoded_name);
+                let _ = tokio::fs::remove_dir_all(&encoded_dir).await;
+            }
+        }
         if let Some(workspace) = auto_workspace_to_delete {
             let workspace_removed = match tokio::fs::remove_dir_all(&workspace).await {
                 Ok(()) => {
@@ -6496,6 +6523,20 @@ pub(crate) async fn apply_agent_title(
         "agent session title applied"
     );
     Ok(true)
+}
+
+fn encode_session_id(session_id: &str) -> String {
+    let mut encoded = String::with_capacity(session_id.len());
+    for byte in session_id.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push('%');
+            use std::fmt::Write;
+            let _ = write!(&mut encoded, "{byte:02X}");
+        }
+    }
+    encoded
 }
 
 #[cfg(test)]

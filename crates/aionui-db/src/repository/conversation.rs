@@ -175,6 +175,11 @@ pub trait IConversationRepository: Send + Sync {
         params: &MessagePageParams,
     ) -> Result<MessagePageResult, DbError>;
 
+    /// Returns all messages for a conversation in ascending display order (created_at ASC, id ASC).
+    async fn list_all_messages(&self, _user_id: &str, _conv_id: &str) -> Result<Vec<MessageRow>, DbError> {
+        Ok(Vec::new())
+    }
+
     /// Returns a single message scoped to a conversation.
     async fn get_message(
         &self,

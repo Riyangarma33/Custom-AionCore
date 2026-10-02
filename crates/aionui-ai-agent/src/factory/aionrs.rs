@@ -5,18 +5,20 @@ use std::sync::Arc;
 use aion_agent::session::{ForkBoundary, Session, SessionManager};
 use aion_config::compat::OpenAiApiMode;
 use aion_config::config::{McpServerConfig, TransportType};
-use aion_types::message::ImageInputCapability;
+use aion_types::message::{ContentBlock, ImageInputCapability, ImageUrl, Message, Role, TokenUsage};
 use aionui_api_types::{
     AionrsBuildExtra, ForkSpec, ModelImageInputCapability, ModelOpenAiApiMode, ModelSettings, SessionMcpServer,
     SessionMcpTransport, TEAM_MCP_SERVER_NAME, TeamMcpStdioConfig,
 };
 use aionui_common::ProviderWithModel;
-use aionui_db::IMcpServerRepository;
-use aionui_db::models::McpServerRow;
+use aionui_db::models::{McpServerRow, MessageRow};
+use aionui_db::{IConversationRepository, IMcpServerRepository};
 use aionui_realtime::EventBroadcaster;
 use aionui_runtime::ensure_runtime_command_with_reporter;
 use serde_json::{Map, Value};
 use tracing::{debug, info, warn};
+
+const SESSION_MAX_RETENTION: usize = 10_000;
 
 use crate::agent_task::AgentInstance;
 use crate::error::AgentError;
@@ -195,7 +197,12 @@ pub(super) async fn build(
         &ctx.workspace,
         &ctx.conversation_id,
         overrides.fork.as_ref(),
-    )?;
+        &ctx.user_id,
+        &provider,
+        &model_id,
+        deps.conversation_repo.as_ref(),
+    )
+    .await?;
 
     let config = AionrsResolvedConfig {
         provider,
@@ -253,48 +260,294 @@ pub(super) async fn build(
     Ok(AgentInstance::Aionrs(Arc::new(agent)))
 }
 
+fn extract_text_content(content_str: &str) -> String {
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(content_str) {
+        if let Some(s) = val.get("content").and_then(|v| v.as_str()) {
+            return s.to_string();
+        }
+        if let Some(s) = val.get("text").and_then(|v| v.as_str()) {
+            return s.to_string();
+        }
+        if let Some(s) = val.as_str() {
+            return s.to_string();
+        }
+    }
+    content_str.to_string()
+}
+
+fn extract_user_content_blocks(content_str: &str) -> Vec<ContentBlock> {
+    let mut blocks = Vec::new();
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(content_str) {
+        if let Some(images) = val.get("images").and_then(|img| img.as_array()) {
+            for img in images {
+                if let Some(url) = img.get("url").and_then(|u| u.as_str()).or_else(|| img.as_str()) {
+                    blocks.push(ContentBlock::Image {
+                        image_url: ImageUrl {
+                            url: url.to_string(),
+                        },
+                    });
+                }
+            }
+        }
+        let text = val
+            .get("content")
+            .and_then(|v| v.as_str())
+            .or_else(|| val.get("text").and_then(|v| v.as_str()))
+            .or_else(|| val.as_str());
+        if let Some(t) = text {
+            if !t.is_empty() {
+                blocks.push(ContentBlock::Text { text: t.to_string() });
+            }
+        }
+    } else if !content_str.is_empty() {
+        blocks.push(ContentBlock::Text { text: content_str.to_string() });
+    }
+    blocks
+}
+
+/// Transform database message rows (user messages, assistant text, tool calls, and tool results)
+/// into `aion_types::message::Message` instances.
+pub fn rehydrate_messages_from_db(rows: &[MessageRow]) -> Vec<Message> {
+    let mut messages = Vec::new();
+
+    for row in rows {
+        if row.hidden {
+            continue;
+        }
+
+        let is_user = row.position.as_deref() == Some("right");
+        let timestamp = chrono::DateTime::from_timestamp_millis(row.created_at);
+
+        match row.r#type.as_str() {
+            "text" => {
+                if is_user {
+                    let blocks = extract_user_content_blocks(&row.content);
+                    if !blocks.is_empty() {
+                        messages.push(Message {
+                            role: Role::User,
+                            content: blocks,
+                            timestamp,
+                            turn_id: row.backend_turn_id.clone(),
+                        });
+                    }
+                } else {
+                    let text = extract_text_content(&row.content);
+                    if !text.trim().is_empty() {
+                        messages.push(Message {
+                            role: Role::Assistant,
+                            content: vec![ContentBlock::Text { text }],
+                            timestamp,
+                            turn_id: row.backend_turn_id.clone(),
+                        });
+                    }
+                }
+            }
+            "tool_call" => {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&row.content) {
+                    let call_id = val
+                        .get("call_id")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| val.get("id").and_then(|v| v.as_str()))
+                        .unwrap_or(&row.id);
+                    let name = val
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| val.get("tool").and_then(|v| v.as_str()))
+                        .unwrap_or("");
+                    let input = val
+                        .get("input")
+                        .cloned()
+                        .filter(|v| !v.is_null())
+                        .or_else(|| val.get("args").cloned().filter(|v| !v.is_null()))
+                        .unwrap_or_else(|| serde_json::json!({}));
+                    let output = val.get("output").and_then(|v| {
+                        if let Some(s) = v.as_str() {
+                            Some(s.to_string())
+                        } else if !v.is_null() {
+                            Some(v.to_string())
+                        } else {
+                            None
+                        }
+                    });
+                    let status = val.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                    let is_error = status == "error";
+
+                    // Assistant tool call
+                    messages.push(Message {
+                        role: Role::Assistant,
+                        content: vec![ContentBlock::ToolUse {
+                            id: call_id.to_string(),
+                            name: name.to_string(),
+                            input,
+                            extra: None,
+                        }],
+                        timestamp,
+                        turn_id: row.backend_turn_id.clone(),
+                    });
+
+                    // Matching user tool result (if finished or has output)
+                    let has_result = output.is_some()
+                        || status == "finish"
+                        || status == "error"
+                        || row.status.as_deref() == Some("finish")
+                        || row.status.as_deref() == Some("error");
+
+                    if has_result {
+                        let content_str = output.unwrap_or_default();
+                        messages.push(Message {
+                            role: Role::User,
+                            content: vec![ContentBlock::ToolResult {
+                                tool_use_id: call_id.to_string(),
+                                content: content_str,
+                                is_error,
+                            }],
+                            timestamp,
+                            turn_id: row.backend_turn_id.clone(),
+                        });
+                    }
+                }
+            }
+            "thinking" => {
+                let text = extract_text_content(&row.content);
+                if !text.trim().is_empty() {
+                    messages.push(Message {
+                        role: Role::Assistant,
+                        content: vec![ContentBlock::Thinking {
+                            thinking: text,
+                            signature: None,
+                        }],
+                        timestamp,
+                        turn_id: row.backend_turn_id.clone(),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    messages
+}
+
 /// Resolve the session an aionrs build starts from.
 ///
 /// Order: an existing session for this conversation (primary layout, then the
 /// legacy in-workspace layout) → a fork materialized from `extra.fork` (first
-/// open of a forked conversation) → none (fresh session).
+/// open of a forked conversation) → transparent SQLite rehydration (when session
+/// directory was pruned by LRU eviction or ghost empty state.json exists) →
+/// none (fresh session).
 ///
 /// Loaded histories are sanitized: orphaned assistant tool-calls left behind
 /// when the user pressed Stop mid-stream are dropped, because strict
 /// providers (Ollama-style, some OpenAI-compatible proxies) reject replayed
 /// assistants with `tool_calls != null` and `content == null` when no
 /// matching tool_result follows. See ELECTRON-1HV / ELECTRON-1J6.
-fn resolve_build_session(
+async fn resolve_build_session(
     session_directory: &Path,
     workspace: &str,
     conversation_id: &str,
     fork: Option<&ForkSpec>,
+    user_id: &str,
+    provider: &str,
+    model: &str,
+    conversation_repo: Option<&Arc<dyn IConversationRepository>>,
 ) -> Result<Option<Session>, AgentError> {
-    let session_mgr = SessionManager::new(session_directory.to_path_buf(), 100);
+    let session_mgr = SessionManager::new(session_directory.to_path_buf(), SESSION_MAX_RETENTION);
     if let Ok(mut session) = session_mgr.load(conversation_id) {
+        if !session.messages.is_empty() {
+            let dropped = sanitize_session_messages(&mut session.messages);
+            info!(
+                conversation_id = %conversation_id,
+                session_id = %session.id,
+                message_count = session.messages.len(),
+                sanitized_dropped = dropped,
+                "Loaded existing aionrs session for resume"
+            );
+            return Ok(Some(session));
+        }
+
+        // Empty session on disk: check if SQLite has message rows to rehydrate
+        if let Some(repo) = conversation_repo {
+            let rows = repo
+                .list_all_messages(user_id, conversation_id)
+                .await
+                .map_err(|e| AgentError::internal(format!("Failed to load messages from DB: {e}")))?;
+            if !rows.is_empty() {
+                let rehydrated = rehydrate_messages_from_db(&rows);
+                if !rehydrated.is_empty() {
+                    session.messages = rehydrated;
+                    session.cwd = workspace.to_string();
+                    session.updated_at = chrono::Utc::now();
+                    let dropped = sanitize_session_messages(&mut session.messages);
+                    session_mgr.save(&session).map_err(|error| {
+                        AgentError::internal(format!("Failed to save rehydrated session: {error}"))
+                    })?;
+                    info!(
+                        conversation_id = %conversation_id,
+                        session_id = %session.id,
+                        message_count = session.messages.len(),
+                        sanitized_dropped = dropped,
+                        "Rehydrated empty aionrs session from SQLite messages"
+                    );
+                    return Ok(Some(session));
+                }
+            }
+        }
+
         let dropped = sanitize_session_messages(&mut session.messages);
         info!(
             conversation_id = %conversation_id,
             session_id = %session.id,
             message_count = session.messages.len(),
             sanitized_dropped = dropped,
-            "Loaded existing aionrs session for resume"
+            "Loaded existing aionrs session for resume (empty)"
         );
         return Ok(Some(session));
     }
 
     // Fallback: old architecture stored sessions inside the workspace.
     let legacy_dir = Path::new(workspace).join(".aionrs/sessions");
-    let legacy_mgr = SessionManager::new(legacy_dir, 100);
+    let legacy_mgr = SessionManager::new(legacy_dir, SESSION_MAX_RETENTION);
     if let Ok(mut session) = legacy_mgr.load(conversation_id) {
+        if !session.messages.is_empty() {
+            let dropped = sanitize_session_messages(&mut session.messages);
+            info!(
+                conversation_id = %conversation_id,
+                session_id = %session.id,
+                message_count = session.messages.len(),
+                sanitized_dropped = dropped,
+                "Loaded legacy aionrs session from workspace"
+            );
+            return Ok(Some(session));
+        }
+
+        if let Some(repo) = conversation_repo {
+            let rows = repo
+                .list_all_messages(user_id, conversation_id)
+                .await
+                .map_err(|e| AgentError::internal(format!("Failed to load messages from DB: {e}")))?;
+            if !rows.is_empty() {
+                let rehydrated = rehydrate_messages_from_db(&rows);
+                if !rehydrated.is_empty() {
+                    session.messages = rehydrated;
+                    session.cwd = workspace.to_string();
+                    session.updated_at = chrono::Utc::now();
+                    let dropped = sanitize_session_messages(&mut session.messages);
+                    session_mgr.save(&session).map_err(|error| {
+                        AgentError::internal(format!("Failed to save rehydrated legacy session: {error}"))
+                    })?;
+                    info!(
+                        conversation_id = %conversation_id,
+                        session_id = %session.id,
+                        message_count = session.messages.len(),
+                        sanitized_dropped = dropped,
+                        "Rehydrated empty legacy aionrs session from SQLite messages"
+                    );
+                    return Ok(Some(session));
+                }
+            }
+        }
+
         let dropped = sanitize_session_messages(&mut session.messages);
-        info!(
-            conversation_id = %conversation_id,
-            session_id = %session.id,
-            message_count = session.messages.len(),
-            sanitized_dropped = dropped,
-            "Loaded legacy aionrs session from workspace"
-        );
         return Ok(Some(session));
     }
 
@@ -310,21 +563,69 @@ fn resolve_build_session(
     // state. The error surfaces through the `runtime/ensure` call the
     // frontend issues right after forking.
     if let Some(fork) = fork {
-        let parent = session_mgr
-            .load(&fork.parent_session_id)
-            .or_else(|_| legacy_mgr.load(&fork.parent_session_id))
-            .map_err(|error| {
-                warn!(
-                    conversation_id = %conversation_id,
-                    parent_session_id = %fork.parent_session_id,
-                    error = %error,
-                    "Fork parent session not found"
-                );
-                AgentError::bad_request(format!(
-                    "Cannot fork: the parent conversation's session '{}' no longer exists",
-                    fork.parent_session_id
-                ))
-            })?;
+        let parent = match session_mgr.load(&fork.parent_session_id).or_else(|_| legacy_mgr.load(&fork.parent_session_id)) {
+            Ok(p) => p,
+            Err(_) => {
+                if let Some(repo) = conversation_repo {
+                    let rows = repo
+                        .list_all_messages(user_id, &fork.parent_session_id)
+                        .await
+                        .map_err(|e| AgentError::internal(format!("Failed to load parent messages from DB: {e}")))?;
+                    if !rows.is_empty() {
+                        let rehydrated = rehydrate_messages_from_db(&rows);
+                        if !rehydrated.is_empty() {
+                            let mut parent_session = Session {
+                                id: fork.parent_session_id.clone(),
+                                forked_from: None,
+                                root_id: None,
+                                created_at: chrono::Utc::now(),
+                                updated_at: chrono::Utc::now(),
+                                provider: provider.to_string(),
+                                model: model.to_string(),
+                                cwd: workspace.to_string(),
+                                total_usage: TokenUsage::default(),
+                                context_state: Default::default(),
+                                messages: rehydrated,
+                            };
+                            let _ = sanitize_session_messages(&mut parent_session.messages);
+                            let _ = session_mgr.save(&parent_session);
+                            parent_session
+                        } else {
+                            warn!(
+                                conversation_id = %conversation_id,
+                                parent_session_id = %fork.parent_session_id,
+                                "Fork parent session not found on disk or DB"
+                            );
+                            return Err(AgentError::bad_request(format!(
+                                "Cannot fork: the parent conversation's session '{}' no longer exists",
+                                fork.parent_session_id
+                            )));
+                        }
+                    } else {
+                        warn!(
+                            conversation_id = %conversation_id,
+                            parent_session_id = %fork.parent_session_id,
+                            "Fork parent session not found on disk or DB"
+                        );
+                        return Err(AgentError::bad_request(format!(
+                            "Cannot fork: the parent conversation's session '{}' no longer exists",
+                            fork.parent_session_id
+                        )));
+                    }
+                } else {
+                    warn!(
+                        conversation_id = %conversation_id,
+                        parent_session_id = %fork.parent_session_id,
+                        "Fork parent session not found"
+                    );
+                    return Err(AgentError::bad_request(format!(
+                        "Cannot fork: the parent conversation's session '{}' no longer exists",
+                        fork.parent_session_id
+                    )));
+                }
+            }
+        };
+
         let boundary = match fork.last_turn_id.as_deref() {
             Some(anchor) => ForkBoundary::AtTurn(anchor),
             None => ForkBoundary::Head,
@@ -351,6 +652,44 @@ fn resolve_build_session(
             "Materialized aionrs fork session from parent"
         );
         return Ok(Some(session));
+    }
+
+    // Session missing from disk: check SQLite for rehydration
+    if let Some(repo) = conversation_repo {
+        let rows = repo
+            .list_all_messages(user_id, conversation_id)
+            .await
+            .map_err(|e| AgentError::internal(format!("Failed to load messages from DB: {e}")))?;
+        if !rows.is_empty() {
+            let rehydrated = rehydrate_messages_from_db(&rows);
+            if !rehydrated.is_empty() {
+                let mut session = Session {
+                    id: conversation_id.to_string(),
+                    forked_from: None,
+                    root_id: None,
+                    created_at: chrono::Utc::now(),
+                    updated_at: chrono::Utc::now(),
+                    provider: provider.to_string(),
+                    model: model.to_string(),
+                    cwd: workspace.to_string(),
+                    total_usage: TokenUsage::default(),
+                    context_state: Default::default(),
+                    messages: rehydrated,
+                };
+                let dropped = sanitize_session_messages(&mut session.messages);
+                session_mgr.save(&session).map_err(|error| {
+                    AgentError::internal(format!("Failed to save rehydrated session: {error}"))
+                })?;
+                info!(
+                    conversation_id = %conversation_id,
+                    session_id = %session.id,
+                    message_count = session.messages.len(),
+                    sanitized_dropped = dropped,
+                    "Rehydrated missing aionrs session from SQLite messages"
+                );
+                return Ok(Some(session));
+            }
+        }
     }
 
     debug!(
@@ -381,9 +720,9 @@ pub fn rewind_aionrs_session(
     conversation_id: &str,
     boundary: RewindBoundary<'_>,
 ) -> Result<usize, AgentError> {
-    let session_mgr = SessionManager::new(session_directory.to_path_buf(), 100);
+    let session_mgr = SessionManager::new(session_directory.to_path_buf(), SESSION_MAX_RETENTION);
     let legacy_dir = Path::new(workspace).join(".aionrs/sessions");
-    let legacy_mgr = SessionManager::new(legacy_dir, 100);
+    let legacy_mgr = SessionManager::new(legacy_dir, SESSION_MAX_RETENTION);
 
     let mut session = match session_mgr.load(conversation_id) {
         Ok(s) => s,
@@ -2254,7 +2593,7 @@ mod tests {
     fn seeded_parent_session(dir: &Path, conversation_id: &str) -> Session {
         use aion_types::message::{ContentBlock, Message, Role};
 
-        let mgr = SessionManager::new(dir.to_path_buf(), 100);
+        let mgr = SessionManager::new(dir.to_path_buf(), SESSION_MAX_RETENTION);
         let mut session = mgr
             .create("anthropic", "test-model", "/tmp", Some(conversation_id))
             .expect("create parent session");
@@ -2273,7 +2612,7 @@ mod tests {
     fn seeded_parent_session_with_turns(dir: &Path, conversation_id: &str) -> Session {
         use aion_types::message::{ContentBlock, Message, Role};
 
-        let mgr = SessionManager::new(dir.to_path_buf(), 100);
+        let mgr = SessionManager::new(dir.to_path_buf(), SESSION_MAX_RETENTION);
         let mut session = mgr
             .create("anthropic", "test-model", "/tmp", Some(conversation_id))
             .expect("create parent session");
@@ -2295,13 +2634,33 @@ mod tests {
         }
     }
 
-    #[test]
-    fn resolve_build_session_materializes_fork_from_parent_once() {
+    async fn resolve_build_session_for_test(
+        session_directory: &Path,
+        workspace: &str,
+        conversation_id: &str,
+        fork: Option<&ForkSpec>,
+    ) -> Result<Option<Session>, AgentError> {
+        resolve_build_session(
+            session_directory,
+            workspace,
+            conversation_id,
+            fork,
+            "test-user",
+            "anthropic",
+            "test-model",
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn resolve_build_session_materializes_fork_from_parent_once() {
         let dir = tempfile::tempdir().unwrap();
         let parent = seeded_parent_session(dir.path(), "parent-conv");
         let spec = head_fork_spec("parent-conv");
 
-        let fork = resolve_build_session(dir.path(), "/nonexistent-workspace", "fork-conv", Some(&spec))
+        let fork = resolve_build_session_for_test(dir.path(), "/nonexistent-workspace", "fork-conv", Some(&spec))
+            .await
             .expect("materialization must not error")
             .expect("fork materialized");
         assert_eq!(fork.id, "fork-conv");
@@ -2309,28 +2668,30 @@ mod tests {
         assert_eq!(fork.messages.len(), parent.messages.len());
 
         // The parent session is untouched and still loadable.
-        let mgr = SessionManager::new(dir.path().to_path_buf(), 100);
+        let mgr = SessionManager::new(dir.path().to_path_buf(), SESSION_MAX_RETENTION);
         let reloaded_parent = mgr.load("parent-conv").expect("parent still loadable");
         assert_eq!(reloaded_parent.messages.len(), parent.messages.len());
         assert!(reloaded_parent.forked_from.is_none());
 
         // Second open takes the resume path (the fork was persisted), not a
         // second materialization.
-        let resumed = resolve_build_session(dir.path(), "/nonexistent-workspace", "fork-conv", Some(&spec))
+        let resumed = resolve_build_session_for_test(dir.path(), "/nonexistent-workspace", "fork-conv", Some(&spec))
+            .await
             .expect("resume must not error")
             .expect("resume the materialized fork");
         assert_eq!(resumed.id, "fork-conv");
         assert_eq!(resumed.forked_from.as_deref(), Some("parent-conv"));
     }
 
-    #[test]
-    fn resolve_build_session_at_turn_fork_truncates_at_anchor() {
+    #[tokio::test]
+    async fn resolve_build_session_at_turn_fork_truncates_at_anchor() {
         let dir = tempfile::tempdir().unwrap();
         let parent = seeded_parent_session_with_turns(dir.path(), "parent-conv");
         let mut spec = head_fork_spec("parent-conv");
         spec.last_turn_id = Some("turn_a".to_owned());
 
-        let fork = resolve_build_session(dir.path(), "/nonexistent-workspace", "fork-conv", Some(&spec))
+        let fork = resolve_build_session_for_test(dir.path(), "/nonexistent-workspace", "fork-conv", Some(&spec))
+            .await
             .expect("materialization must not error")
             .expect("fork materialized");
         assert_eq!(fork.messages.len(), 2, "cut after the last turn_a message");
@@ -2338,8 +2699,8 @@ mod tests {
         assert!(fork.messages.len() < parent.messages.len());
     }
 
-    #[test]
-    fn resolve_build_session_unresolvable_anchor_is_an_error() {
+    #[tokio::test]
+    async fn resolve_build_session_unresolvable_anchor_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
         seeded_parent_session(dir.path(), "parent-conv");
         let mut spec = head_fork_spec("parent-conv");
@@ -2347,37 +2708,40 @@ mod tests {
         // compaction-folded turn. Must error, never silently fork elsewhere.
         spec.last_turn_id = Some("turn_gone".to_owned());
 
-        let err = resolve_build_session(dir.path(), "/nonexistent-workspace", "fork-conv", Some(&spec))
+        let err = resolve_build_session_for_test(dir.path(), "/nonexistent-workspace", "fork-conv", Some(&spec))
+            .await
             .expect_err("unresolvable anchor must be a hard error");
         assert!(err.to_string().contains("Cannot fork"), "unexpected error: {err}");
     }
 
-    #[test]
-    fn resolve_build_session_missing_fork_parent_is_an_error() {
+    #[tokio::test]
+    async fn resolve_build_session_missing_fork_parent_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
         let spec = head_fork_spec("never-existed");
 
-        let err = resolve_build_session(dir.path(), "/nonexistent-workspace", "fork-conv", Some(&spec))
+        let err = resolve_build_session_for_test(dir.path(), "/nonexistent-workspace", "fork-conv", Some(&spec))
+            .await
             .expect_err("missing parent must be a hard error, not a silent fresh session");
         assert!(err.to_string().contains("no longer exists"), "unexpected error: {err}");
     }
 
-    #[test]
-    fn resolve_build_session_existing_session_wins_over_fork_spec() {
+    #[tokio::test]
+    async fn resolve_build_session_existing_session_wins_over_fork_spec() {
         let dir = tempfile::tempdir().unwrap();
         seeded_parent_session(dir.path(), "parent-conv");
         // The conversation already has its own session (e.g. the fork was
         // materialized earlier and diverged): the fork spec must be ignored.
-        let mgr = SessionManager::new(dir.path().to_path_buf(), 100);
+        let mgr = SessionManager::new(dir.path().to_path_buf(), SESSION_MAX_RETENTION);
         mgr.create("anthropic", "test-model", "/tmp", Some("fork-conv"))
             .expect("existing session for the conversation");
 
-        let session = resolve_build_session(
+        let session = resolve_build_session_for_test(
             dir.path(),
             "/nonexistent-workspace",
             "fork-conv",
             Some(&head_fork_spec("parent-conv")),
         )
+        .await
         .expect("resume must not error")
         .expect("existing session returned");
         assert_eq!(session.id, "fork-conv");
@@ -2388,12 +2752,281 @@ mod tests {
         assert!(session.messages.is_empty());
     }
 
-    #[test]
-    fn resolve_build_session_no_session_no_fork_is_fresh() {
+    #[tokio::test]
+    async fn resolve_build_session_no_session_no_fork_is_fresh() {
         let dir = tempfile::tempdir().unwrap();
-        let resolved = resolve_build_session(dir.path(), "/nonexistent-workspace", "conv", None)
+        let resolved = resolve_build_session_for_test(dir.path(), "/nonexistent-workspace", "conv", None)
+            .await
             .expect("fresh path must not error");
         assert!(resolved.is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_build_session_rehydrates_missing_session_from_sqlite_with_intact_tool_pairings() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = aionui_db::init_database_memory().await.unwrap();
+        let repo: Arc<dyn IConversationRepository> =
+            Arc::new(aionui_db::SqliteConversationRepository::new(db.pool().clone()));
+
+        let user_id = "system_default_user";
+        let conv_id = "conv-rehydrate-pairing";
+
+        // Create conversation
+        let conv = aionui_db::models::ConversationRow {
+            id: conv_id.to_string(),
+            user_id: user_id.to_string(),
+            name: "Test Conversation".to_string(),
+            r#type: "aionrs".to_string(),
+            extra: "{}".to_string(),
+            model: None,
+            status: Some("finish".to_string()),
+            source: Some("aionui".to_string()),
+            channel_chat_id: None,
+            created_at: 1000,
+            updated_at: 1000,
+            name_source: None,
+        };
+        repo.create(&conv).await.unwrap();
+
+        // 1. User message
+        let user_msg = aionui_db::models::MessageRow {
+            id: "msg-1".into(),
+            conversation_id: conv_id.into(),
+            msg_id: Some("msg-1".into()),
+            r#type: "text".into(),
+            content: serde_json::json!({ "content": "Read a file" }).to_string(),
+            position: Some("right".into()),
+            status: Some("finish".into()),
+            hidden: false,
+            created_at: 1100,
+            backend_turn_id: Some("turn-1".into()),
+        };
+        repo.insert_message(user_id, &user_msg).await.unwrap();
+
+        // 2. Assistant tool call with completed output
+        let tool_msg = aionui_db::models::MessageRow {
+            id: "call-1".into(),
+            conversation_id: conv_id.into(),
+            msg_id: Some("call-1".into()),
+            r#type: "tool_call".into(),
+            content: serde_json::json!({
+                "call_id": "call-1",
+                "name": "Read",
+                "args": { "file_path": "/tmp/test.txt" },
+                "status": "finish",
+                "output": "file content here"
+            })
+            .to_string(),
+            position: Some("left".into()),
+            status: Some("finish".into()),
+            hidden: false,
+            created_at: 1200,
+            backend_turn_id: Some("turn-1".into()),
+        };
+        repo.insert_message(user_id, &tool_msg).await.unwrap();
+
+        // 3. Assistant final text
+        let asst_msg = aionui_db::models::MessageRow {
+            id: "msg-2".into(),
+            conversation_id: conv_id.into(),
+            msg_id: Some("msg-2".into()),
+            r#type: "text".into(),
+            content: serde_json::json!({ "content": "I read the file." }).to_string(),
+            position: Some("left".into()),
+            status: Some("finish".into()),
+            hidden: false,
+            created_at: 1300,
+            backend_turn_id: Some("turn-1".into()),
+        };
+        repo.insert_message(user_id, &asst_msg).await.unwrap();
+
+        // Directory on disk is empty (session missing from disk)
+        let resolved = resolve_build_session(
+            dir.path(),
+            "/tmp/test-workspace",
+            conv_id,
+            None,
+            user_id,
+            "anthropic",
+            "claude-sonnet-4-20250514",
+            Some(&repo),
+        )
+        .await
+        .expect("rehydration must not error")
+        .expect("rehydrated session returned");
+
+        assert_eq!(resolved.id, conv_id);
+        assert_eq!(resolved.messages.len(), 4);
+
+        // Verify message types and intact tool pairing
+        assert_eq!(resolved.messages[0].role, Role::User);
+        assert!(matches!(&resolved.messages[0].content[0], ContentBlock::Text { text } if text == "Read a file"));
+
+        assert_eq!(resolved.messages[1].role, Role::Assistant);
+        assert!(matches!(&resolved.messages[1].content[0], ContentBlock::ToolUse { id, name, .. } if id == "call-1" && name == "Read"));
+
+        assert_eq!(resolved.messages[2].role, Role::User);
+        assert!(matches!(&resolved.messages[2].content[0], ContentBlock::ToolResult { tool_use_id, content, is_error } if tool_use_id == "call-1" && content == "file content here" && !is_error));
+
+        assert_eq!(resolved.messages[3].role, Role::Assistant);
+        assert!(matches!(&resolved.messages[3].content[0], ContentBlock::Text { text } if text == "I read the file."));
+
+        // Verify the rehydrated session was persisted to disk via SessionManager
+        let mgr = SessionManager::new(dir.path().to_path_buf(), SESSION_MAX_RETENTION);
+        let loaded = mgr.load(conv_id).expect("session must be persisted on disk");
+        assert_eq!(loaded.messages.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn resolve_build_session_rehydrates_and_sanitizes_orphaned_assistant_tool_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = aionui_db::init_database_memory().await.unwrap();
+        let repo: Arc<dyn IConversationRepository> =
+            Arc::new(aionui_db::SqliteConversationRepository::new(db.pool().clone()));
+
+        let user_id = "system_default_user";
+        let conv_id = "conv-rehydrate-orphan";
+
+        let conv = aionui_db::models::ConversationRow {
+            id: conv_id.to_string(),
+            user_id: user_id.to_string(),
+            name: "Orphan Test".to_string(),
+            r#type: "aionrs".to_string(),
+            extra: "{}".to_string(),
+            model: None,
+            status: Some("finish".to_string()),
+            source: Some("aionui".to_string()),
+            channel_chat_id: None,
+            created_at: 1000,
+            updated_at: 1000,
+            name_source: None,
+        };
+        repo.create(&conv).await.unwrap();
+
+        // 1. User prompt
+        let user_msg = aionui_db::models::MessageRow {
+            id: "msg-user".into(),
+            conversation_id: conv_id.into(),
+            msg_id: Some("msg-user".into()),
+            r#type: "text".into(),
+            content: serde_json::json!({ "content": "Run an action" }).to_string(),
+            position: Some("right".into()),
+            status: Some("finish".into()),
+            hidden: false,
+            created_at: 1100,
+            backend_turn_id: Some("turn-1".into()),
+        };
+        repo.insert_message(user_id, &user_msg).await.unwrap();
+
+        // 2. Orphaned tool call (status work, output null - e.g. Stop pressed)
+        let orphan_tool_msg = aionui_db::models::MessageRow {
+            id: "call-orphan".into(),
+            conversation_id: conv_id.into(),
+            msg_id: Some("call-orphan".into()),
+            r#type: "tool_call".into(),
+            content: serde_json::json!({
+                "call_id": "call-orphan",
+                "name": "Write",
+                "args": { "path": "/tmp/never_finished.txt" },
+                "status": "work"
+            })
+            .to_string(),
+            position: Some("left".into()),
+            status: Some("work".into()),
+            hidden: false,
+            created_at: 1200,
+            backend_turn_id: Some("turn-1".into()),
+        };
+        repo.insert_message(user_id, &orphan_tool_msg).await.unwrap();
+
+        // Rehydrate: missing session on disk
+        let resolved = resolve_build_session(
+            dir.path(),
+            "/tmp/test-workspace",
+            conv_id,
+            None,
+            user_id,
+            "anthropic",
+            "claude-sonnet-4-20250514",
+            Some(&repo),
+        )
+        .await
+        .expect("rehydration must not error")
+        .expect("rehydrated session returned");
+
+        // The orphaned assistant tool call MUST be dropped by sanitize_session_messages
+        assert_eq!(resolved.messages.len(), 1);
+        assert_eq!(resolved.messages[0].role, Role::User);
+        assert!(matches!(&resolved.messages[0].content[0], ContentBlock::Text { text } if text == "Run an action"));
+    }
+
+    #[tokio::test]
+    async fn resolve_build_session_rehydrates_empty_session_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = aionui_db::init_database_memory().await.unwrap();
+        let repo: Arc<dyn IConversationRepository> =
+            Arc::new(aionui_db::SqliteConversationRepository::new(db.pool().clone()));
+
+        let user_id = "system_default_user";
+        let conv_id = "conv-rehydrate-empty-disk";
+
+        let conv = aionui_db::models::ConversationRow {
+            id: conv_id.to_string(),
+            user_id: user_id.to_string(),
+            name: "Empty on disk test".to_string(),
+            r#type: "aionrs".to_string(),
+            extra: "{}".to_string(),
+            model: None,
+            status: Some("finish".to_string()),
+            source: Some("aionui".to_string()),
+            channel_chat_id: None,
+            created_at: 1000,
+            updated_at: 1000,
+            name_source: None,
+        };
+        repo.create(&conv).await.unwrap();
+
+        let user_msg = aionui_db::models::MessageRow {
+            id: "msg-user".into(),
+            conversation_id: conv_id.into(),
+            msg_id: Some("msg-user".into()),
+            r#type: "text".into(),
+            content: serde_json::json!({ "content": "Hello again" }).to_string(),
+            position: Some("right".into()),
+            status: Some("finish".into()),
+            hidden: false,
+            created_at: 1100,
+            backend_turn_id: None,
+        };
+        repo.insert_message(user_id, &user_msg).await.unwrap();
+
+        // Create an EMPTY session on disk (ghost empty session)
+        let mgr = SessionManager::new(dir.path().to_path_buf(), SESSION_MAX_RETENTION);
+        let empty_session = mgr
+            .create("anthropic", "test-model", "/tmp", Some(conv_id))
+            .expect("create empty session");
+        assert!(empty_session.messages.is_empty());
+
+        let resolved = resolve_build_session(
+            dir.path(),
+            "/tmp/test-workspace",
+            conv_id,
+            None,
+            user_id,
+            "anthropic",
+            "test-model",
+            Some(&repo),
+        )
+        .await
+        .expect("rehydration must not error")
+        .expect("session returned");
+
+        assert_eq!(resolved.messages.len(), 1);
+        assert_eq!(resolved.messages[0].role, Role::User);
+
+        // Verify disk has been updated
+        let reloaded = mgr.load(conv_id).expect("reload from disk");
+        assert_eq!(reloaded.messages.len(), 1);
     }
 
     #[test]
@@ -2405,7 +3038,7 @@ mod tests {
             .expect("rewind must succeed");
         assert_eq!(removed, 2, "turn_b's 2 messages must be removed");
 
-        let mgr = SessionManager::new(dir.path().to_path_buf(), 100);
+        let mgr = SessionManager::new(dir.path().to_path_buf(), SESSION_MAX_RETENTION);
         let reloaded = mgr.load("test-conv").expect("session must reload");
         assert_eq!(reloaded.messages.len(), 2);
         assert!(reloaded.messages.iter().all(|m| m.turn_id.as_deref() == Some("turn_a")));
@@ -2420,7 +3053,7 @@ mod tests {
             .expect("rewind must succeed");
         assert_eq!(removed, 4, "all 4 messages must be removed");
 
-        let mgr = SessionManager::new(dir.path().to_path_buf(), 100);
+        let mgr = SessionManager::new(dir.path().to_path_buf(), SESSION_MAX_RETENTION);
         let reloaded = mgr.load("test-conv").expect("session must reload");
         assert!(reloaded.messages.is_empty());
     }
@@ -2434,7 +3067,7 @@ mod tests {
             .expect("rewind at HEAD must succeed");
         assert_eq!(removed, 0);
 
-        let mgr = SessionManager::new(dir.path().to_path_buf(), 100);
+        let mgr = SessionManager::new(dir.path().to_path_buf(), SESSION_MAX_RETENTION);
         let reloaded = mgr.load("test-conv").expect("session must reload");
         assert_eq!(reloaded.messages.len(), 4);
     }

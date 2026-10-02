@@ -2749,6 +2749,29 @@ async fn delete_removes_auto_provisioned_workspace_directory() {
 }
 
 #[tokio::test]
+async fn delete_removes_aionrs_session_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("aionui-data");
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service_with_workspace_root(data_dir.clone());
+    let svc = svc.with_data_dir(data_dir.clone());
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "aionrs",
+        "extra": {}
+    }))
+    .unwrap();
+
+    let conv = svc.create("user_1", req).await.unwrap();
+    let session_dir = data_dir.join("aionrs-sessions").join(&conv.id);
+    std::fs::create_dir_all(&session_dir).unwrap();
+    std::fs::write(session_dir.join("state.json"), "{}").unwrap();
+    assert!(session_dir.is_dir());
+
+    svc.delete("user_1", &conv.id).await.unwrap();
+
+    assert!(!session_dir.exists(), "aionrs-sessions/<cid> must be removed on conversation delete");
+}
+
+#[tokio::test]
 async fn delete_removes_empty_date_workspace_parents() {
     let temp = tempfile::tempdir().unwrap();
     let workspace_root = temp.path().join("aionui-data");

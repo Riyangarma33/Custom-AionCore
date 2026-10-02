@@ -83,6 +83,7 @@ fn make_factory(
     build_agent_factory(AgentFactoryDeps {
         skill_manager: AcpSkillManager::new(skill_paths),
         provider_repo,
+        conversation_repo: None,
         encryption_key: test_encryption_key(),
         agent_registry,
         acp_agent_service,

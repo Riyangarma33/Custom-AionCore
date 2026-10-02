@@ -1018,6 +1018,23 @@ impl IConversationRepository for SqliteConversationRepository {
         self.page_with_flags(user_id, conv_id, rows).await
     }
 
+    async fn list_all_messages(&self, user_id: &str, conv_id: &str) -> Result<Vec<MessageRow>, DbError> {
+        self.ensure_conversation_for_user(user_id, conv_id).await?;
+        let rows = sqlx::query_as::<_, MessageRow>(
+            "SELECT m.* FROM messages m \
+              INNER JOIN conversations c ON c.id = m.conversation_id \
+              WHERE c.user_id = ? \
+                AND m.conversation_id = ? \
+                AND m.type NOT IN ('cron_trigger', 'skill_suggest') \
+              ORDER BY m.created_at ASC, m.id ASC",
+        )
+        .bind(user_id)
+        .bind(conv_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
     async fn get_message(&self, user_id: &str, conv_id: &str, message_id: &str) -> Result<Option<MessageRow>, DbError> {
         let row = sqlx::query_as::<_, MessageRow>(
             "SELECT m.* FROM messages m \

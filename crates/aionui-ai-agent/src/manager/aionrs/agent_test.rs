@@ -345,6 +345,17 @@ async fn runtime_can_emit_error_and_finish() {
 }
 
 #[test]
+fn build_aionrs_config_sets_max_sessions_retention_override() {
+    let cfg = make_test_config();
+    let config = build_aionrs_config("/tmp/test-workspace", &cfg).unwrap();
+    assert!(
+        config.session.max_sessions >= 10_000,
+        "max_sessions must be at least 10,000 to prevent LRU session eviction, was {}",
+        config.session.max_sessions
+    );
+}
+
+#[test]
 fn build_aionrs_config_uses_db_override_when_present() {
     let mut cfg = make_test_config();
     cfg.compat_overrides.context_window = Some(128_000);

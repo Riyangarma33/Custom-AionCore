@@ -10,7 +10,7 @@ pub(crate) mod provider_model_context;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use aionui_db::{IMcpServerRepository, IProviderRepository};
+use aionui_db::{IConversationRepository, IMcpServerRepository, IProviderRepository};
 use aionui_realtime::EventBroadcaster;
 use futures_util::FutureExt;
 
@@ -28,6 +28,8 @@ use crate::types::BuildTaskOptions;
 pub struct AgentFactoryDeps {
     pub skill_manager: Arc<AcpSkillManager>,
     pub provider_repo: Arc<dyn IProviderRepository>,
+    /// Optional conversation repository used by aionrs to rehydrate missing/evicted sessions from SQLite.
+    pub conversation_repo: Option<Arc<dyn IConversationRepository>>,
     pub encryption_key: [u8; 32],
     pub agent_registry: Arc<AgentRegistry>,
     pub acp_agent_service: Arc<AcpSessionSyncService>,

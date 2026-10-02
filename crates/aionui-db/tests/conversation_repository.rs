@@ -821,6 +821,45 @@ async fn delete_messages_by_conversation_clears_all() {
 }
 
 #[tokio::test]
+async fn list_all_messages_returns_chronological_order() {
+    let (repo, _db) = setup().await;
+    let conv = make_conversation("msg-all");
+    repo.create(&conv).await.unwrap();
+
+    let m1 = MessageRow {
+        id: "msg-1".into(),
+        conversation_id: conv.id.clone(),
+        msg_id: Some("msg-1".into()),
+        r#type: "text".into(),
+        content: serde_json::json!({ "content": "first" }).to_string(),
+        position: Some("right".into()),
+        status: Some("finish".into()),
+        hidden: false,
+        created_at: 1000,
+        backend_turn_id: None,
+    };
+    let m2 = MessageRow {
+        id: "msg-2".into(),
+        conversation_id: conv.id.clone(),
+        msg_id: Some("msg-2".into()),
+        r#type: "text".into(),
+        content: serde_json::json!({ "content": "second" }).to_string(),
+        position: Some("left".into()),
+        status: Some("finish".into()),
+        hidden: false,
+        created_at: 2000,
+        backend_turn_id: None,
+    };
+    repo.insert_message(&conv.user_id, &m2).await.unwrap();
+    repo.insert_message(&conv.user_id, &m1).await.unwrap();
+
+    let all = repo.list_all_messages(&conv.user_id, &conv.id).await.unwrap();
+    assert_eq!(all.len(), 2);
+    assert_eq!(all[0].id, "msg-1");
+    assert_eq!(all[1].id, "msg-2");
+}
+
+#[tokio::test]
 async fn get_message_by_msg_id_triple() {
     let (repo, _db) = setup().await;
     let conv = make_conversation("msg-find");

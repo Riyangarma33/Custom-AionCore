@@ -102,6 +102,7 @@ pub(crate) fn build_aionrs_config(
     config.bedrock = config_extra.bedrock_config.clone();
     config.session.enabled = true;
     config.session.directory = config_extra.session_directory.to_string_lossy().into_owned();
+    config.session.max_sessions = 10_000;
     config.compat.image_input = Some(image_input_capability);
 
     if let Some(mode) = config_extra.compat_overrides.openai_api_mode {
