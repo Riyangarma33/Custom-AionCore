@@ -37,6 +37,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 which.workspace = true
+chrono.workspace = true
 aion-agent.workspace = true
 aion-providers.workspace = true
 aion-types.workspace = true

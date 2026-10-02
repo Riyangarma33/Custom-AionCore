@@ -243,6 +243,39 @@ pub trait IConversationRepository: Send + Sync {
         ))
     }
 
+    /// Deletes all messages in a conversation at or strictly after `(created_at, id)` cursor
+    /// in a single transaction (deleting the target message and all subsequent turns),
+    /// and deletes any conversation_artifacts created at or after `created_at`.
+    /// Updates conversation `updated_at` to the newest remaining message timestamp (or conversation `created_at`).
+    /// When `expected_updated_at` is provided, verifies `conversations.updated_at` matches
+    /// to guard against concurrent modifications (returning `DbError::Conflict`).
+    /// Returns the number of deleted message rows.
+    ///
+    /// The conversation must belong to `user_id`. Default is unsupported so
+    /// test doubles that never rewind don't have to implement it.
+    async fn delete_messages_from(
+        &self,
+        _user_id: &str,
+        _conversation_id: &str,
+        _cursor: (TimestampMs, &str),
+        _expected_updated_at: Option<TimestampMs>,
+    ) -> Result<u64, DbError> {
+        Err(DbError::Init(
+            "delete_messages_from is not supported by this repository".into(),
+        ))
+    }
+
+    /// Resolves the backend turn anchor of the turn immediately before `cursor`.
+    /// Used by `revert` to cut session history before the target user message's turn.
+    async fn resolve_backend_turn_anchor_before(
+        &self,
+        _user_id: &str,
+        _conv_id: &str,
+        _cursor: (TimestampMs, &str),
+    ) -> Result<Option<String>, DbError> {
+        Ok(None)
+    }
+
     /// Newest message of one type in a conversation, or `None`.
     ///
     /// Exists for the plan bar: `upsert_message` does not refresh `created_at`,

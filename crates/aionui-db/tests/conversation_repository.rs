@@ -1463,3 +1463,160 @@ async fn resolve_backend_turn_anchor_is_user_scoped() {
         .unwrap();
     assert_eq!(anchor, None, "foreign conversations must resolve to nothing");
 }
+
+#[tokio::test]
+async fn delete_messages_from_deletes_target_and_subsequent_messages() {
+    let (repo, _db) = setup().await;
+    let conv = make_conversation("revert-test");
+    repo.create(&conv).await.unwrap();
+
+    let m1 = make_message_at(&conv.id, "one", 1000, Some("turn_a"));
+    let mut m2 = make_message_at(&conv.id, "two", 2000, None);
+    let mut m3 = make_message_at(&conv.id, "three", 2000, Some("turn_b"));
+    m2.id = "2000-a".to_string();
+    m3.id = "2000-b".to_string();
+    let m4 = make_message_at(&conv.id, "four", 3000, None);
+    for m in [&m1, &m2, &m3, &m4] {
+        repo.insert_message(USER_ID, m).await.unwrap();
+    }
+
+    // Insert an artifact before cursor and an artifact after cursor
+    let art_keep = aionui_db::models::ConversationArtifactRow {
+        id: "art-keep".into(),
+        conversation_id: conv.id.clone(),
+        cron_job_id: None,
+        kind: "cron_trigger".into(),
+        status: "active".into(),
+        payload: "{}".into(),
+        created_at: 1500,
+        updated_at: 1500,
+    };
+    let art_del = aionui_db::models::ConversationArtifactRow {
+        id: "art-del".into(),
+        conversation_id: conv.id.clone(),
+        cron_job_id: None,
+        kind: "cron_trigger".into(),
+        status: "active".into(),
+        payload: "{}".into(),
+        created_at: 2000,
+        updated_at: 2000,
+    };
+    repo.upsert_artifact(USER_ID, &art_keep).await.unwrap();
+    repo.upsert_artifact(USER_ID, &art_del).await.unwrap();
+
+    let current = repo.get(USER_ID, &conv.id).await.unwrap().unwrap();
+
+    // Revert at m2 (2000, "2000-a"): m2, m3 and m4 must be deleted.
+    let deleted = repo
+        .delete_messages_from(USER_ID, &conv.id, (2000, &m2.id), Some(current.updated_at))
+        .await
+        .unwrap();
+    assert_eq!(deleted, 3, "m2, m3 and m4 must be deleted");
+
+    let page = repo
+        .list_messages_page(
+            USER_ID,
+            &conv.id,
+            &MessagePageParams {
+                limit: 50,
+                direction: MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].id, m1.id);
+
+    // Artifacts check
+    let artifacts = repo.list_artifacts(USER_ID, &conv.id).await.unwrap();
+    assert_eq!(artifacts.len(), 1);
+    assert_eq!(artifacts[0].id, "art-keep");
+
+    // Conversation updated_at must be updated to newest remaining message (m1 = 1000)
+    let updated_conv = repo.get(USER_ID, &conv.id).await.unwrap().unwrap();
+    assert_eq!(updated_conv.updated_at, 1000);
+}
+
+#[tokio::test]
+async fn delete_messages_from_at_first_message_clears_all() {
+    let (repo, _db) = setup().await;
+    let conv = make_conversation("revert-first");
+    repo.create(&conv).await.unwrap();
+
+    let m1 = make_message_at(&conv.id, "one", 1000, Some("turn_a"));
+    let m2 = make_message_at(&conv.id, "two", 2000, None);
+    repo.insert_message(USER_ID, &m1).await.unwrap();
+    repo.insert_message(USER_ID, &m2).await.unwrap();
+
+    let current = repo.get(USER_ID, &conv.id).await.unwrap().unwrap();
+
+    let deleted = repo
+        .delete_messages_from(USER_ID, &conv.id, (1000, &m1.id), Some(current.updated_at))
+        .await
+        .unwrap();
+    assert_eq!(deleted, 2);
+
+    let page = repo
+        .list_messages_page(
+            USER_ID,
+            &conv.id,
+            &MessagePageParams {
+                limit: 50,
+                direction: MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.items.len(), 0);
+}
+
+#[tokio::test]
+async fn delete_messages_from_rejects_concurrent_modification() {
+    let (repo, _db) = setup().await;
+    let conv = make_conversation("revert-conflict");
+    repo.create(&conv).await.unwrap();
+
+    let m1 = make_message_at(&conv.id, "one", 1000, Some("turn_a"));
+    repo.insert_message(USER_ID, &m1).await.unwrap();
+
+    // Expect updated_at = 99999, but actual updated_at is different
+    let err = repo
+        .delete_messages_from(USER_ID, &conv.id, (1000, &m1.id), Some(99999))
+        .await
+        .unwrap_err();
+    match err {
+        aionui_db::DbError::Conflict(msg) => {
+            assert!(msg.contains("REVERT_CONCURRENT_MODIFICATION"));
+        }
+        other => panic!("expected Conflict error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn resolve_backend_turn_anchor_before_finds_prior_turn_anchor() {
+    let (repo, _db) = setup().await;
+    let conv = make_conversation("prior-anchor-test");
+    repo.create(&conv).await.unwrap();
+
+    let m1 = make_message_at(&conv.id, "u1", 1000, None);
+    let m2 = make_message_at(&conv.id, "a1", 1100, Some("turn_1"));
+    let m3 = make_message_at(&conv.id, "u2", 2000, None);
+    let m4 = make_message_at(&conv.id, "a2", 2100, Some("turn_2"));
+    for m in [&m1, &m2, &m3, &m4] {
+        repo.insert_message(USER_ID, m).await.unwrap();
+    }
+
+    // Cursor at u2 (2000, m3.id): prior turn anchor is m2's turn_1
+    let prior_anchor = repo
+        .resolve_backend_turn_anchor_before(USER_ID, &conv.id, (2000, &m3.id))
+        .await
+        .unwrap();
+    assert_eq!(prior_anchor.as_deref(), Some("turn_1"));
+
+    // Cursor at u1 (1000, m1.id): no prior turn anchor
+    let first_anchor = repo
+        .resolve_backend_turn_anchor_before(USER_ID, &conv.id, (1000, &m1.id))
+        .await
+        .unwrap();
+    assert_eq!(first_anchor, None);
+}

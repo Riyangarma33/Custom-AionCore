@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use aionui_ai_agent::{AgentError, IWorkerTaskManager};
 use aionui_api_types::{
-    CloneConversationRequest, CreateConversationRequest, ListMessagesQuery, SearchMessagesQuery, WebSocketMessage,
+    CloneConversationRequest, CreateConversationRequest, ListMessagesQuery, RevertConversationRequest,
+    SearchMessagesQuery, WebSocketMessage,
 };
 use aionui_common::{AgentKillReason, ConversationStatus, TimestampMs, generate_prefixed_id, now_ms};
 use aionui_conversation::skill_resolver::SkillResolver;
@@ -1262,5 +1263,115 @@ async fn get_projects_fork_capability_for_aionrs_on_detail_path() {
         detail.fork_capability,
         Some(aionui_api_types::ForkCapabilityView { at_turn: true }),
         "detail path projects the aionrs fork capability via the builtin binding ladder"
+    );
+}
+
+// ── In-place revert (Phase 3.8a) ────────────────────────────────────
+
+#[tokio::test]
+async fn revert_mid_history_deletes_target_and_subsequent_messages() {
+    let (svc, repo, _acp_repo) = setup_fork().await;
+    let conv = svc.create(USER_ID, aionrs_create_req()).await.unwrap();
+
+    let m1 = make_message(&conv.id, "u1", 1000);
+    let mut m2 = make_message(&conv.id, "a1", 1100);
+    m2.backend_turn_id = Some("turn_1".into());
+    let m3 = make_message(&conv.id, "u2", 2000);
+    let m4 = make_message(&conv.id, "a2", 2100);
+    for m in [&m1, &m2, &m3, &m4] {
+        repo.insert_message(USER_ID, m).await.unwrap();
+    }
+
+    let res = svc
+        .revert(
+            USER_ID,
+            &conv.id,
+            RevertConversationRequest {
+                message_id: m3.id.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res.conversation_id, conv.id);
+    assert_eq!(res.truncated_count, 2, "m3 and m4 must be deleted");
+    assert_eq!(res.reverted_message.id, m3.id);
+
+    let messages = repo
+        .list_messages_page(
+            USER_ID,
+            &conv.id,
+            &aionui_db::MessagePageParams {
+                limit: 10,
+                direction: aionui_db::MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(messages.items.len(), 2);
+    assert_eq!(messages.items[0].id, m1.id);
+    assert_eq!(messages.items[1].id, m2.id);
+}
+
+#[tokio::test]
+async fn revert_first_message_clears_all_messages() {
+    let (svc, repo, _acp_repo) = setup_fork().await;
+    let conv = svc.create(USER_ID, aionrs_create_req()).await.unwrap();
+
+    let m1 = make_message(&conv.id, "one", 1000);
+    let m2 = make_message(&conv.id, "two", 2000);
+    repo.insert_message(USER_ID, &m1).await.unwrap();
+    repo.insert_message(USER_ID, &m2).await.unwrap();
+
+    let res = svc
+        .revert(
+            USER_ID,
+            &conv.id,
+            RevertConversationRequest {
+                message_id: m1.id.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res.truncated_count, 2, "m1 and m2 must be deleted");
+    assert_eq!(res.reverted_message.id, m1.id);
+
+    let messages = repo
+        .list_messages_page(
+            USER_ID,
+            &conv.id,
+            &aionui_db::MessagePageParams {
+                limit: 10,
+                direction: aionui_db::MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(messages.items.len(), 0);
+}
+
+#[tokio::test]
+async fn revert_non_aionrs_is_refused() {
+    let (svc, repo, _acp_repo) = setup_fork().await;
+    let conv = svc.create(USER_ID, fork_create_req("claude")).await.unwrap();
+
+    let m1 = make_message(&conv.id, "one", 1000);
+    repo.insert_message(USER_ID, &m1).await.unwrap();
+
+    let err = svc
+        .revert(
+            USER_ID,
+            &conv.id,
+            RevertConversationRequest {
+                message_id: m1.id.clone(),
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(&err, ConversationError::Unprocessable { reason } if reason.starts_with("REVERT_UNSUPPORTED")),
+        "non-aionrs revert must be refused with REVERT_UNSUPPORTED, got {err:?}"
     );
 }

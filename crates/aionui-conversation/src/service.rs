@@ -22,7 +22,8 @@ use aionui_api_types::{
     ConversationNameUpdatedPayload, ConversationResponse, ConversationRuntimeSummary, CreateConversationRequest,
     EnsureConversationRuntimeResponse, ForkCapabilityView, ForkConversationRequest, ListConversationsQuery,
     ListMessagesQuery, McpRuntimeSnapshot, MessageListResponse, MessageResponse, MessageSearchResponse,
-    PromptCapabilityView, SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionMcpServer,
+    PromptCapabilityView, RevertConversationRequest, RevertConversationResponse, RevertedMessageSummary,
+    SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionMcpServer,
     SessionMcpTransport, TEAM_MCP_SERVER_NAME, TeamMcpSelection, TeamSessionBinding, UpdateConversationArtifactRequest,
     UpdateConversationRequest, UpdateConversationRuntimeBindingsRequest, UpdateConversationRuntimeBindingsResponse,
     WebSocketMessage, assistant_avatar_response_value,
@@ -355,6 +356,7 @@ pub struct ConversationService {
     conversation_repo: Arc<dyn IConversationRepository>,
     agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
     acp_session_repo: Arc<dyn IAcpSessionRepository>,
+    data_dir: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -431,7 +433,20 @@ impl ConversationService {
             conversation_repo,
             agent_metadata_repo,
             acp_session_repo,
+            data_dir: None,
         }
+    }
+
+    pub fn with_data_dir(mut self, data_dir: PathBuf) -> Self {
+        self.data_dir = Some(data_dir);
+        self
+    }
+
+    pub fn aionrs_sessions_directory(&self) -> PathBuf {
+        self.data_dir
+            .as_ref()
+            .map(|d| d.join("aionrs-sessions"))
+            .unwrap_or_else(|| self.workspace_root.join("aionrs-sessions"))
     }
 
     pub fn with_runtime_state(mut self, runtime_state: Arc<ConversationRuntimeStateService>) -> Self {
@@ -2963,6 +2978,140 @@ impl ConversationService {
         response.fork_capability = Some(fork_capability);
         self.broadcast_list_changed(user_id, &new_id, "created", response.source.as_ref());
         Ok(response)
+    }
+
+    /// Rewind a conversation in-place to `message_id` (inclusive).
+    ///
+    /// Subsequent messages are permanently deleted, and the agent session is truncated
+    /// to the target turn anchor. Currently supported for the builtin `aionrs` agent.
+    pub async fn revert(
+        &self,
+        user_id: &str,
+        id: &str,
+        req: RevertConversationRequest,
+    ) -> Result<RevertConversationResponse, ConversationError> {
+        let parent = self
+            .conversation_repo
+            .get(user_id, id)
+            .await?
+            .ok_or_else(|| ConversationError::NotFound { id: id.to_owned() })?;
+
+        if team_id_from_extra(&parent.extra).is_some() {
+            return Err(ConversationError::Forbidden {
+                reason: "team conversations cannot be rewound".into(),
+            });
+        }
+
+        // A turn in flight means the session is advancing right now.
+        if self.runtime_state.active_turn_id_for(id).is_some() {
+            return Err(ConversationError::Busy {
+                reason: "REVERT_TURN_IN_FLIGHT: wait for the current reply to finish before rewinding".into(),
+            });
+        }
+
+        // Backend scope: scoped to the builtin aionrs agent in Phase 3.8a.
+        if parse_agent_type_from_row(&parent) != Some(AgentType::Aionrs) {
+            return Err(ConversationError::Unprocessable {
+                reason: "REVERT_UNSUPPORTED: rewind is currently only supported for Aion CLI conversations".into(),
+            });
+        }
+
+        let capability_agent_id = self.aionrs_capability_agent_id(user_id, id).await?;
+        let fork_capability = self
+            .fork_capability_for_agent(user_id, &capability_agent_id, &parent.extra)
+            .await?
+            .ok_or_else(|| ConversationError::Unprocessable {
+                reason: "REVERT_UNSUPPORTED: this agent does not support session rewind".into(),
+            })?;
+
+        // Revert point: must be a message of the conversation. Cursor is (created_at, id).
+        let revert_point = match self.conversation_repo.get_message(user_id, id, &req.message_id).await? {
+            Some(row) => row,
+            None => self
+                .conversation_repo
+                .get_message_by_msg_id_any(user_id, id, &req.message_id)
+                .await?
+                .ok_or_else(|| ConversationError::MessageNotFound {
+                    id: req.message_id.clone(),
+                })?,
+        };
+        let cursor = (revert_point.created_at, revert_point.id.as_str());
+
+        // HEAD detection against the visible timeline.
+        let anchor_opt = if fork_capability.at_turn {
+            self.conversation_repo
+                .resolve_backend_turn_anchor_before(user_id, id, cursor)
+                .await?
+        } else {
+            None
+        };
+
+        let rewind_boundary = if fork_capability.at_turn {
+            match anchor_opt.as_deref() {
+                Some(anchor) => aionui_ai_agent::RewindBoundary::AtTurn(anchor),
+                None => aionui_ai_agent::RewindBoundary::ClearAll,
+            }
+        } else {
+            return Err(ConversationError::Unprocessable {
+                reason: "REVERT_POINT_UNSUPPORTED: this agent only supports rewinding from the latest message".into(),
+            });
+        };
+
+        // Materialize session truncation on disk FIRST before touching the DB:
+        // Ordering matters: session materialization before row deletion, so a failure
+        // leaves the DB history intact (safe to retry) rather than deleted-but-orphaned.
+        let session_dir = self.aionrs_sessions_directory();
+        let extra_parsed: Option<serde_json::Value> = serde_json::from_str(&parent.extra).ok();
+        let parent_workspace = extra_parsed
+            .as_ref()
+            .and_then(|v| v.get("workspace"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        aionui_ai_agent::rewind_aionrs_session(
+            &session_dir,
+            parent_workspace,
+            id,
+            rewind_boundary,
+        )
+        .map_err(|e| ConversationError::internal(format!("Failed to rewind session state on disk: {e}")))?;
+
+        // If an in-memory worker task exists, evict it so subsequent turns reload the truncated session.
+        if self.task_manager.get_task(id).is_some() {
+            self.task_manager
+                .kill_and_wait(id, Some(AgentKillReason::RuntimeRestart))
+                .await;
+            self.runtime_state.clear_turn_state_for_restart(id);
+        }
+
+        // Prune database messages and artifacts starting from cursor (inclusive) in a single transaction,
+        // verifying updated_at has not changed since check (concurrent modification guard).
+        let truncated_count = self
+            .conversation_repo
+            .delete_messages_from(user_id, id, cursor, Some(parent.updated_at))
+            .await?;
+
+        info!(
+            conversation_id = %id,
+            revert_message_id = %revert_point.id,
+            truncated_count = truncated_count,
+            "Conversation rewound in-place"
+        );
+
+        let source: Option<ConversationSource> = parent
+            .source
+            .as_deref()
+            .and_then(|s| string_to_enum::<ConversationSource>(s).ok());
+        self.broadcast_list_changed(user_id, id, "updated", source.as_ref());
+
+        Ok(RevertConversationResponse {
+            conversation_id: id.to_owned(),
+            truncated_count: truncated_count as usize,
+            reverted_message: RevertedMessageSummary {
+                id: revert_point.id,
+                content: revert_point.content,
+            },
+        })
     }
 
     /// Agent identity owning capability metadata for an aionrs conversation

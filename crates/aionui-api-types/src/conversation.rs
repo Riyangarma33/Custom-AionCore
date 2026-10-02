@@ -101,6 +101,31 @@ pub struct ForkConversationRequest {
     pub name: Option<String>,
 }
 
+/// Body for `POST /api/conversations/{id}/revert`.
+///
+/// Rewinds the conversation in-place to `message_id` (inclusive), deleting
+/// subsequent messages and truncating the backend session to that turn.
+#[derive(Debug, Deserialize)]
+pub struct RevertConversationRequest {
+    /// The target message to rewind to (inclusive). Subsequent messages will be deleted.
+    pub message_id: String,
+}
+
+/// Summary of the message reverted to.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RevertedMessageSummary {
+    pub id: String,
+    pub content: String,
+}
+
+/// Response for `POST /api/conversations/{id}/revert`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RevertConversationResponse {
+    pub conversation_id: String,
+    pub truncated_count: usize,
+    pub reverted_message: RevertedMessageSummary,
+}
+
 /// Prompt media capability projection for one conversation, sourced from
 /// the effective `prompt_capabilities` projection (ACP handshake or constructed
 /// backend descriptor). `None` =

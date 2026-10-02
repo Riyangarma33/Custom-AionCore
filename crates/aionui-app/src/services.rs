@@ -134,6 +134,7 @@ impl AppServices {
             runtime_token_service: self.runtime_token_service.clone(),
             project_service: self.project_service.clone(),
             user_order_store: self.user_order_store.clone(),
+            data_dir: self.data_dir.clone(),
         });
         self
     }
@@ -404,6 +405,7 @@ impl AppServices {
             runtime_token_service: runtime_token_service.clone(),
             project_service: project_service.clone(),
             user_order_store: user_order_store.clone(),
+            data_dir: data_dir.clone(),
         });
 
         let session_message_queue = Arc::new(DeliveryQueue::new(Arc::new(SystemClock)));
@@ -482,6 +484,7 @@ struct ConversationServiceDeps<'a> {
     /// conversation cascades away its `user_order` rows (sidebar design §4.3,
     /// path 1).
     user_order_store: Arc<dyn IUserOrderStore>,
+    data_dir: PathBuf,
 }
 
 fn build_conversation_service(deps: ConversationServiceDeps<'_>) -> ConversationService {
@@ -498,6 +501,7 @@ fn build_conversation_service(deps: ConversationServiceDeps<'_>) -> Conversation
         Arc::new(SqliteAgentMetadataRepository::new(deps.database.pool().clone())),
         Arc::new(SqliteAcpSessionRepository::new(deps.database.pool().clone())),
     )
+    .with_data_dir(deps.data_dir)
     .with_runtime_state(deps.conversation_runtime_state)
     .with_runtime_helper_context(deps.runtime_helper_bin, deps.runtime_base_url)
     .with_runtime_token_service(deps.runtime_token_service);

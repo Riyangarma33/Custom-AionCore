@@ -360,6 +360,94 @@ fn resolve_build_session(
     Ok(None)
 }
 
+/// Boundary defining where to truncate session messages during a rewind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RewindBoundary<'a> {
+    /// Revert at HEAD: keep existing session messages intact.
+    Head,
+    /// Revert through the given anchor turn (inclusive); truncate subsequent messages.
+    AtTurn(&'a str),
+    /// Revert to before the first recorded turn (e.g. at the first user prompt); clear all session messages.
+    ClearAll,
+}
+
+/// Truncate/rewind an aionrs session in-place according to the given boundary.
+///
+/// The updated session is persisted to disk.
+/// Returns the number of session messages removed.
+pub fn rewind_aionrs_session(
+    session_directory: &Path,
+    workspace: &str,
+    conversation_id: &str,
+    boundary: RewindBoundary<'_>,
+) -> Result<usize, AgentError> {
+    let session_mgr = SessionManager::new(session_directory.to_path_buf(), 100);
+    let legacy_dir = Path::new(workspace).join(".aionrs/sessions");
+    let legacy_mgr = SessionManager::new(legacy_dir, 100);
+
+    let mut session = match session_mgr.load(conversation_id) {
+        Ok(s) => s,
+        Err(_) => match legacy_mgr.load(conversation_id) {
+            Ok(s) => s,
+            Err(_) => {
+                debug!(
+                    conversation_id = %conversation_id,
+                    "Session file does not exist on disk, nothing to rewind"
+                );
+                return Ok(0);
+            }
+        },
+    };
+
+    let removed = match boundary {
+        RewindBoundary::Head => 0,
+        RewindBoundary::AtTurn(anchor_turn) => {
+            let cut = session
+                .messages
+                .iter()
+                .rposition(|message| message.turn_id.as_deref() == Some(anchor_turn))
+                .ok_or_else(|| {
+                    warn!(
+                        conversation_id = %conversation_id,
+                        anchor_turn = %anchor_turn,
+                        "Rewind anchor turn not found in session history"
+                    );
+                    AgentError::bad_request(format!(
+                        "Cannot rewind: anchor turn '{anchor_turn}' not found in session '{conversation_id}' history"
+                    ))
+                })?;
+            let removed_count = session.messages.len().saturating_sub(cut + 1);
+            session.messages.truncate(cut + 1);
+            removed_count
+        }
+        RewindBoundary::ClearAll => {
+            let removed_count = session.messages.len();
+            session.messages.clear();
+            removed_count
+        }
+    };
+
+    session.updated_at = chrono::Utc::now();
+    session_mgr.save(&session).map_err(|error| {
+        warn!(
+            conversation_id = %conversation_id,
+            error = %error,
+            "Failed to save rewound session"
+        );
+        AgentError::internal(format!("Failed to save rewound session: {error}"))
+    })?;
+
+    info!(
+        conversation_id = %conversation_id,
+        boundary = ?boundary,
+        removed_messages = removed,
+        remaining_messages = session.messages.len(),
+        "Rewound aionrs session in-place"
+    );
+
+    Ok(removed)
+}
+
 /// Map AionUi DB platform/protocol settings to the aionrs provider identifier.
 pub(crate) fn map_aionrs_provider(
     platform: &str,
@@ -2306,6 +2394,67 @@ mod tests {
         let resolved = resolve_build_session(dir.path(), "/nonexistent-workspace", "conv", None)
             .expect("fresh path must not error");
         assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn rewind_aionrs_session_truncates_at_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let _parent = seeded_parent_session_with_turns(dir.path(), "test-conv");
+
+        let removed = rewind_aionrs_session(dir.path(), "/tmp", "test-conv", RewindBoundary::AtTurn("turn_a"))
+            .expect("rewind must succeed");
+        assert_eq!(removed, 2, "turn_b's 2 messages must be removed");
+
+        let mgr = SessionManager::new(dir.path().to_path_buf(), 100);
+        let reloaded = mgr.load("test-conv").expect("session must reload");
+        assert_eq!(reloaded.messages.len(), 2);
+        assert!(reloaded.messages.iter().all(|m| m.turn_id.as_deref() == Some("turn_a")));
+    }
+
+    #[test]
+    fn rewind_aionrs_session_clear_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let _parent = seeded_parent_session_with_turns(dir.path(), "test-conv");
+
+        let removed = rewind_aionrs_session(dir.path(), "/tmp", "test-conv", RewindBoundary::ClearAll)
+            .expect("rewind must succeed");
+        assert_eq!(removed, 4, "all 4 messages must be removed");
+
+        let mgr = SessionManager::new(dir.path().to_path_buf(), 100);
+        let reloaded = mgr.load("test-conv").expect("session must reload");
+        assert!(reloaded.messages.is_empty());
+    }
+
+    #[test]
+    fn rewind_aionrs_session_at_head_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let _parent = seeded_parent_session_with_turns(dir.path(), "test-conv");
+
+        let removed = rewind_aionrs_session(dir.path(), "/tmp", "test-conv", RewindBoundary::Head)
+            .expect("rewind at HEAD must succeed");
+        assert_eq!(removed, 0);
+
+        let mgr = SessionManager::new(dir.path().to_path_buf(), 100);
+        let reloaded = mgr.load("test-conv").expect("session must reload");
+        assert_eq!(reloaded.messages.len(), 4);
+    }
+
+    #[test]
+    fn rewind_aionrs_session_unknown_anchor_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let _parent = seeded_parent_session_with_turns(dir.path(), "test-conv");
+
+        let err = rewind_aionrs_session(dir.path(), "/tmp", "test-conv", RewindBoundary::AtTurn("invalid_anchor"))
+            .expect_err("unknown anchor must error");
+        assert!(err.to_string().contains("Cannot rewind"));
+    }
+
+    #[test]
+    fn rewind_aionrs_session_missing_session_returns_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let removed = rewind_aionrs_session(dir.path(), "/tmp", "nonexistent-conv", RewindBoundary::AtTurn("turn_a"))
+            .expect("missing session should safely return 0");
+        assert_eq!(removed, 0);
     }
 
     #[test]

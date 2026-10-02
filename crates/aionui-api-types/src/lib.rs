@@ -106,7 +106,8 @@ pub use conversation::{
     ConversationNameUpdatedPayload, ConversationResponse, ConversationRuntimeStateKind, ConversationRuntimeSummary,
     CreateConversationRequest, EnsureConversationRuntimeResponse, ForkCapabilityView, ForkConversationRequest,
     ListConversationsQuery, ListMessagesQuery, McpRuntimeSnapshot, MessageListResponse, MessageResponse,
-    MessageSearchItem, MessageSearchResponse, MessageStatusChangedPayload, PromptCapabilityView, SearchMessagesQuery,
+    MessageSearchItem, MessageSearchResponse, MessageStatusChangedPayload, PromptCapabilityView,
+    RevertConversationRequest, RevertConversationResponse, RevertedMessageSummary, SearchMessagesQuery,
     SendMessageRequest, SendMessageResponse, SessionRef, UpdateConversationArtifactRequest, UpdateConversationRequest,
     UpdateConversationRuntimeBindingsRequest, UpdateConversationRuntimeBindingsResponse,
 };

@@ -1209,6 +1209,125 @@ impl IConversationRepository for SqliteConversationRepository {
         }
     }
 
+    async fn delete_messages_from(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        cursor: (TimestampMs, &str),
+        expected_updated_at: Option<TimestampMs>,
+    ) -> Result<u64, DbError> {
+        let (cursor_created_at, cursor_id) = cursor;
+
+        let mut connection = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *connection).await?;
+
+        let result: Result<u64, DbError> = async {
+            let exists: i64 =
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM conversations WHERE user_id = ? AND id = ?)")
+                    .bind(user_id)
+                    .bind(conversation_id)
+                    .fetch_one(&mut *connection)
+                    .await?;
+            if exists == 0 {
+                return Err(DbError::NotFound(format!("Conversation '{conversation_id}' not found")));
+            }
+
+            if let Some(expected) = expected_updated_at {
+                let current_updated_at: Option<TimestampMs> = sqlx::query_scalar(
+                    "SELECT updated_at FROM conversations WHERE user_id = ? AND id = ?",
+                )
+                .bind(user_id)
+                .bind(conversation_id)
+                .fetch_optional(&mut *connection)
+                .await?;
+
+                if current_updated_at != Some(expected) {
+                    return Err(DbError::Conflict(
+                        "REVERT_CONCURRENT_MODIFICATION: conversation was modified concurrently".into(),
+                    ));
+                }
+            }
+
+            let deleted = sqlx::query(
+                "DELETE FROM messages \
+                 WHERE conversation_id = ? \
+                   AND (created_at > ? OR (created_at = ? AND id >= ?))",
+            )
+            .bind(conversation_id)
+            .bind(cursor_created_at)
+            .bind(cursor_created_at)
+            .bind(cursor_id)
+            .execute(&mut *connection)
+            .await?
+            .rows_affected();
+
+            sqlx::query(
+                "DELETE FROM conversation_artifacts \
+                 WHERE conversation_id = ? \
+                   AND created_at >= ?",
+            )
+            .bind(conversation_id)
+            .bind(cursor_created_at)
+            .execute(&mut *connection)
+            .await?;
+
+            sqlx::query(
+                "UPDATE conversations \
+                 SET updated_at = COALESCE( \
+                     (SELECT MAX(created_at) FROM messages WHERE conversation_id = ?), \
+                     created_at \
+                 ) \
+                 WHERE user_id = ? AND id = ?",
+            )
+            .bind(conversation_id)
+            .bind(user_id)
+            .bind(conversation_id)
+            .execute(&mut *connection)
+            .await?;
+
+            Ok(deleted)
+        }
+        .await;
+
+        match result {
+            Ok(count) => {
+                sqlx::query("COMMIT").execute(&mut *connection).await?;
+                Ok(count)
+            }
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn resolve_backend_turn_anchor_before(
+        &self,
+        user_id: &str,
+        conv_id: &str,
+        cursor: (TimestampMs, &str),
+    ) -> Result<Option<String>, DbError> {
+        let (cursor_created_at, cursor_id) = cursor;
+        let anchor: Option<String> = sqlx::query_scalar(
+            "SELECT m.backend_turn_id FROM messages m \
+             INNER JOIN conversations c ON c.id = m.conversation_id \
+             WHERE c.user_id = ? AND m.conversation_id = ? \
+               AND m.backend_turn_id IS NOT NULL \
+               AND (m.created_at < ? OR (m.created_at = ? AND m.id < ?)) \
+             ORDER BY m.created_at DESC, m.id DESC \
+             LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(conv_id)
+        .bind(cursor_created_at)
+        .bind(cursor_created_at)
+        .bind(cursor_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(anchor)
+    }
+
     async fn resolve_backend_turn_anchor(
         &self,
         user_id: &str,
