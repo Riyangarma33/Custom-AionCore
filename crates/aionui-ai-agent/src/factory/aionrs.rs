@@ -305,6 +305,12 @@ fn extract_user_content_blocks(content_str: &str) -> Vec<ContentBlock> {
     blocks
 }
 
+fn is_valid_tool_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with("cancelled:")
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
 /// Transform database message rows (user messages, assistant text, tool calls, and tool results)
 /// into `aion_types::message::Message` instances.
 pub fn rehydrate_messages_from_db(rows: &[MessageRow]) -> Vec<Message> {
@@ -354,6 +360,10 @@ pub fn rehydrate_messages_from_db(rows: &[MessageRow]) -> Vec<Message> {
                         .and_then(|v| v.as_str())
                         .or_else(|| val.get("tool").and_then(|v| v.as_str()))
                         .unwrap_or("");
+
+                    if !is_valid_tool_name(name) {
+                        continue;
+                    }
                     let input = val
                         .get("input")
                         .cloned()
@@ -3027,6 +3037,98 @@ mod tests {
         // Verify disk has been updated
         let reloaded = mgr.load(conv_id).expect("reload from disk");
         assert_eq!(reloaded.messages.len(), 1);
+    }
+
+    #[test]
+    fn rehydrate_messages_from_db_skips_invalid_and_cancelled_tool_calls() {
+        let rows = vec![
+            MessageRow {
+                id: "msg-user".into(),
+                conversation_id: "conv-1".into(),
+                msg_id: Some("msg-user".into()),
+                r#type: "text".into(),
+                content: serde_json::json!({ "content": "Execute a command" }).to_string(),
+                position: Some("right".into()),
+                status: Some("finish".into()),
+                hidden: false,
+                created_at: 1000,
+                backend_turn_id: None,
+            },
+            // Tool call with user-denial UI row: name is "cancelled: User denied the tool request"
+            MessageRow {
+                id: "tool-denied".into(),
+                conversation_id: "conv-1".into(),
+                msg_id: Some("tool-denied".into()),
+                r#type: "tool_call".into(),
+                content: serde_json::json!({
+                    "call_id": "tool-denied",
+                    "name": "cancelled: User denied the tool request",
+                    "status": "finish",
+                    "args": {}
+                })
+                .to_string(),
+                position: Some("left".into()),
+                status: Some("finish".into()),
+                hidden: false,
+                created_at: 1050,
+                backend_turn_id: None,
+            },
+            // Tool call with invalid characters in name (spaces, special chars)
+            MessageRow {
+                id: "tool-invalid-name".into(),
+                conversation_id: "conv-1".into(),
+                msg_id: Some("tool-invalid-name".into()),
+                r#type: "tool_call".into(),
+                content: serde_json::json!({
+                    "call_id": "tool-invalid-name",
+                    "name": "invalid tool name with spaces!",
+                    "status": "finish",
+                    "args": {}
+                })
+                .to_string(),
+                position: Some("left".into()),
+                status: Some("finish".into()),
+                hidden: false,
+                created_at: 1060,
+                backend_turn_id: None,
+            },
+            // Legitimate tool execution row with valid name
+            MessageRow {
+                id: "aionrs-call_valid123".into(),
+                conversation_id: "conv-1".into(),
+                msg_id: Some("aionrs-call_valid123".into()),
+                r#type: "tool_call".into(),
+                content: serde_json::json!({
+                    "call_id": "aionrs-call_valid123",
+                    "name": "ExecuteCommand",
+                    "status": "finish",
+                    "args": { "cmd": "ls" },
+                    "output": "file1.txt\nfile2.txt"
+                })
+                .to_string(),
+                position: Some("left".into()),
+                status: Some("finish".into()),
+                hidden: false,
+                created_at: 1100,
+                backend_turn_id: None,
+            },
+        ];
+
+        let messages = rehydrate_messages_from_db(&rows);
+
+        // Should contain 3 messages: user text, valid assistant tool_use, and valid user tool_result
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].role, Role::User);
+        assert_eq!(messages[1].role, Role::Assistant);
+        assert!(matches!(
+            &messages[1].content[0],
+            ContentBlock::ToolUse { name, .. } if name == "ExecuteCommand"
+        ));
+        assert_eq!(messages[2].role, Role::User);
+        assert!(matches!(
+            &messages[2].content[0],
+            ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "aionrs-call_valid123"
+        ));
     }
 
     #[test]
