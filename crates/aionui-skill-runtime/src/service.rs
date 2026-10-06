@@ -36,22 +36,27 @@ impl SkillRuntimeService {
         }
     }
 
-    /// The allow-list: names in this conversation's `extra.skills` snapshot.
-    async fn enabled_skill_names(
+    /// Extract the allow-list of enabled skill names and optional workspace path for this conversation.
+    async fn conversation_skill_context(
         &self,
         user_id: &str,
         conversation_id: &str,
-    ) -> Result<Vec<String>, SkillRuntimeError> {
+    ) -> Result<(Vec<String>, Option<PathBuf>), SkillRuntimeError> {
         let row = self
             .conversation_repo
             .get(user_id, conversation_id)
             .await?
             .ok_or(SkillRuntimeError::ConversationNotFound)?;
         let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap_or(serde_json::Value::Null);
-        Ok(extra
+        let enabled = extra
             .get("skills")
             .and_then(|value| serde_json::from_value::<Vec<String>>(value.clone()).ok())
-            .unwrap_or_default())
+            .unwrap_or_default();
+        let workspace = extra
+            .get("workspace")
+            .and_then(|value| value.as_str())
+            .map(PathBuf::from);
+        Ok((enabled, workspace))
     }
 
     /// `skills list` — only what this conversation enabled.
@@ -66,7 +71,7 @@ impl SkillRuntimeService {
         user_id: &str,
         conversation_id: &str,
     ) -> Result<RuntimeSkillListResponse, SkillRuntimeError> {
-        let enabled = self.enabled_skill_names(user_id, conversation_id).await?;
+        let (enabled, workspace) = self.conversation_skill_context(user_id, conversation_id).await?;
         if enabled.is_empty() {
             return Ok(RuntimeSkillListResponse { skills: Vec::new() });
         }
@@ -77,6 +82,7 @@ impl SkillRuntimeService {
             user_id,
             conversation_id,
             &enabled,
+            workspace.as_deref(),
         )
         .await
         .map_err(|e| SkillRuntimeError::ReadFailed { reason: e.to_string() })?;
@@ -125,7 +131,8 @@ impl SkillRuntimeService {
         conversation_id: &str,
         name: &str,
     ) -> Result<PathBuf, SkillRuntimeError> {
-        let enabled = self.enabled_skill_names(user_id, conversation_id).await?;
+        let (enabled, workspace) = self.conversation_skill_context(user_id, conversation_id).await?;
+
         if !enabled.iter().any(|candidate| candidate == name) {
             warn!(
                 conversation_id = %conversation_id,
@@ -144,6 +151,7 @@ impl SkillRuntimeService {
             user_id,
             conversation_id,
             std::slice::from_ref(&name.to_owned()),
+            workspace.as_deref(),
         )
         .await
         .map_err(|e| SkillRuntimeError::ReadFailed { reason: e.to_string() })?;

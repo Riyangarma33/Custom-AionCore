@@ -2,6 +2,7 @@
 //! `ConversationService` can compute the initial snapshot without forcing
 //! every test setup to stand up a real `SkillPaths` and skill repository.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use aionui_db::ISkillRepository;
@@ -42,6 +43,16 @@ pub trait SkillResolver: Send + Sync {
         self.resolve_skills(names).await
     }
 
+    /// Resolve each skill name for a specific Core user with optional workspace context.
+    async fn resolve_skills_for_user_with_workspace(
+        &self,
+        user_id: &str,
+        names: &[String],
+        _workspace: Option<&Path>,
+    ) -> Vec<ResolvedAgentSkill> {
+        self.resolve_skills_for_user(user_id, names).await
+    }
+
     /// Load full skill bodies for prompt-protocol agents that request
     /// `[LOAD_SKILL: name]` in their response.
     async fn load_skill_bodies(&self, names: &[String]) -> Vec<LoadedAgentSkill> {
@@ -52,6 +63,17 @@ pub trait SkillResolver: Send + Sync {
     /// Load full skill bodies for prompt-protocol agents under one Core user.
     async fn load_skill_bodies_for_user(&self, user_id: &str, names: &[String]) -> Vec<LoadedAgentSkill> {
         let resolved = self.resolve_skills_for_user(user_id, names).await;
+        load_resolved_skill_bodies(&resolved).await
+    }
+
+    /// Load full skill bodies for prompt-protocol agents under one Core user with optional workspace context.
+    async fn load_skill_bodies_for_user_with_workspace(
+        &self,
+        user_id: &str,
+        names: &[String],
+        workspace: Option<&Path>,
+    ) -> Vec<LoadedAgentSkill> {
+        let resolved = self.resolve_skills_for_user_with_workspace(user_id, names, workspace).await;
         load_resolved_skill_bodies(&resolved).await
     }
 
@@ -142,10 +164,19 @@ impl SkillResolver for ExtensionSkillResolver {
     }
 
     async fn resolve_skills(&self, names: &[String]) -> Vec<ResolvedAgentSkill> {
-        self.resolve_skills_for_user("system_default_user", names).await
+        self.resolve_skills_for_user_with_workspace("system_default_user", names, None).await
     }
 
     async fn resolve_skills_for_user(&self, user_id: &str, names: &[String]) -> Vec<ResolvedAgentSkill> {
+        self.resolve_skills_for_user_with_workspace(user_id, names, None).await
+    }
+
+    async fn resolve_skills_for_user_with_workspace(
+        &self,
+        user_id: &str,
+        names: &[String],
+        workspace: Option<&Path>,
+    ) -> Vec<ResolvedAgentSkill> {
         if names.is_empty() {
             return Vec::new();
         }
@@ -157,6 +188,7 @@ impl SkillResolver for ExtensionSkillResolver {
             user_id,
             "skill-resolve",
             names,
+            workspace,
         )
         .await
         {

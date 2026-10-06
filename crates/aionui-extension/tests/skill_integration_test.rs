@@ -214,7 +214,7 @@ async fn user_scoped_materialize_does_not_backfill_shared_legacy_skill() {
     let repo = SqliteSkillRepository::new(db.pool().clone());
 
     let resolved =
-        materialize_skills_for_agent_with_repo_for_user(&paths, &repo, &user_a, "conv-1", &["legacy-only".to_owned()])
+        materialize_skills_for_agent_with_repo_for_user(&paths, &repo, &user_a, "conv-1", &["legacy-only".to_owned()], None)
             .await
             .unwrap();
     assert!(resolved.is_empty());
@@ -231,6 +231,7 @@ async fn user_scoped_materialize_does_not_backfill_shared_legacy_skill() {
         "system_default_user",
         "conv-1",
         &["legacy-only".to_owned()],
+        None,
     )
     .await
     .unwrap();
@@ -269,11 +270,11 @@ async fn user_scoped_imports_with_same_name_use_distinct_storage() {
     assert!(content_b.contains("body-b"));
 
     let resolved_a =
-        materialize_skills_for_agent_with_repo_for_user(&paths, &repo, &user_a, "conv-1", &["shared".to_owned()])
+        materialize_skills_for_agent_with_repo_for_user(&paths, &repo, &user_a, "conv-1", &["shared".to_owned()], None)
             .await
             .unwrap();
     let resolved_b =
-        materialize_skills_for_agent_with_repo_for_user(&paths, &repo, &user_b, "conv-1", &["shared".to_owned()])
+        materialize_skills_for_agent_with_repo_for_user(&paths, &repo, &user_b, "conv-1", &["shared".to_owned()], None)
             .await
             .unwrap();
     assert_eq!(resolved_a[0].source_path, Path::new(&row_a.path));
@@ -309,7 +310,7 @@ async fn user_skill_override_wins_over_builtin_during_materialization() {
     let user_row = repo.find_by_name_for_user(&user_id, "shared").await.unwrap().unwrap();
 
     let resolved =
-        materialize_skills_for_agent_with_repo_for_user(&paths, &repo, &user_id, "conv-1", &["shared".to_owned()])
+        materialize_skills_for_agent_with_repo_for_user(&paths, &repo, &user_id, "conv-1", &["shared".to_owned()], None)
             .await
             .unwrap();
 

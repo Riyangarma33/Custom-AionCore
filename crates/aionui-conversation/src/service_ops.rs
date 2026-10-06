@@ -8,7 +8,7 @@
 //! over 2000 lines.
 
 use std::collections::HashMap;
-use std::path::Component;
+use std::path::{Component, Path};
 
 use aionui_ai_agent::{AcpError, AgentError};
 use aionui_api_types::{
@@ -289,11 +289,68 @@ impl ConversationService {
         user_id: &str,
         conversation_id: &str,
     ) -> Result<Vec<SlashCommandItem>, ConversationError> {
-        self.ensure_owned_conversation(user_id, conversation_id).await?;
-        self.task(conversation_id)?
-            .get_slash_commands()
+        let row = self
+            .conversation_repo()
+            .get(user_id, conversation_id)
             .await
-            .map_err(ConversationError::from)
+            .map_err(|e| ConversationError::internal(format!("Failed to load conversation: {e}")))?
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
+
+        let mut commands = match self.task(conversation_id) {
+            Ok(task) => task.get_slash_commands().await.unwrap_or_default(),
+            Err(_) => Vec::new(),
+        };
+
+        if let Ok(extra) = serde_json::from_str::<serde_json::Value>(&row.extra) {
+            let enabled_skills = extra
+                .get("skills")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|item| item.as_str().map(str::to_string))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+
+            if !enabled_skills.is_empty() {
+                let workspace_path = extra
+                    .get("workspace")
+                    .and_then(|v| v.as_str())
+                    .map(Path::new);
+                let resolved = self
+                    .skill_resolver()
+                    .resolve_skills_for_user_with_workspace(user_id, &enabled_skills, workspace_path)
+                    .await;
+
+                let existing_commands: std::collections::HashSet<String> =
+                    commands.iter().map(|c| c.command.trim_start_matches('/').to_lowercase()).collect();
+
+                for skill in resolved {
+                    let cmd_name = skill.name.clone();
+                    if !existing_commands.contains(&cmd_name.to_lowercase()) {
+                        let manifest_path = skill.source_path.join("SKILL.md");
+                        let desc = if let Ok(content) = std::fs::read_to_string(&manifest_path) {
+                            aionui_extension::skill_service::parse_frontmatter_fields(&content)
+                                .map(|(_, description)| description)
+                                .unwrap_or_default()
+                        } else {
+                            String::new()
+                        };
+                        commands.push(SlashCommandItem {
+                            command: cmd_name,
+                            description: desc,
+                            completion_behavior: None,
+                            empty_turn_tip_code: None,
+                            empty_turn_tip_params: None,
+                        });
+                    }
+                }
+            }
+        }
+
+        Ok(commands)
     }
 
     // ── Side question ───────────────────────────────────────────────

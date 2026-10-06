@@ -265,6 +265,7 @@ pub enum SkillSource {
     Custom,
     Cron,
     Extension,
+    Workspace,
 }
 
 /// A discovered skill item for listing.
@@ -416,7 +417,7 @@ async fn list_builtin_skills_from_disk(dir: &Path) -> Vec<SkillListItem> {
 }
 
 /// A skill discovered during directory scanning.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ScannedSkill {
     pub name: String,
     pub description: String,
@@ -1332,16 +1333,17 @@ pub async fn materialize_skills_for_agent_with_repo(
     conversation_id: &str,
     skills: &[String],
 ) -> Result<Vec<ResolvedAgentSkill>, ExtensionError> {
-    materialize_skills_for_agent_with_repo_for_user(paths, repo, DEFAULT_USER_ID, conversation_id, skills).await
+    materialize_skills_for_agent_with_repo_for_user(paths, repo, DEFAULT_USER_ID, conversation_id, skills, None).await
 }
 
-/// Resolve requested skill names using global and user-owned database state.
+/// Resolve requested skill names using global, user-owned, and optional workspace state.
 pub async fn materialize_skills_for_agent_with_repo_for_user(
     paths: &SkillPaths,
     repo: &dyn ISkillRepository,
     user_id: &str,
     conversation_id: &str,
     skills: &[String],
+    workspace: Option<&Path>,
 ) -> Result<Vec<ResolvedAgentSkill>, ExtensionError> {
     validate_filename(conversation_id)?;
     sync_disk_user_skills_into_repo_for_user(paths, repo, user_id).await?;
@@ -1355,7 +1357,7 @@ pub async fn materialize_skills_for_agent_with_repo_for_user(
             warn!(skill = %name, "skipping skill with invalid name");
             continue;
         }
-        match resolve_skill_source_path_with_repo_for_user(paths, repo, user_id, name).await? {
+        match resolve_skill_source_path_with_repo_for_user(paths, repo, user_id, name, workspace).await? {
             Some(source_path) => resolved.push(ResolvedAgentSkill {
                 name: name.clone(),
                 source_path,
@@ -1418,7 +1420,34 @@ async fn resolve_skill_source_path_with_repo_for_user(
     repo: &dyn ISkillRepository,
     user_id: &str,
     name: &str,
+    workspace: Option<&Path>,
 ) -> Result<Option<PathBuf>, ExtensionError> {
+    // 1. Workspace project skills (highest precedence)
+    if let Some(ws_path) = workspace {
+        let ws_skills = scan_workspace_skills_bounded(ws_path, ws_path).await;
+        if let Some(found) = ws_skills.into_iter().find(|s| s.name == name) {
+            let ws_skill_path = PathBuf::from(found.path);
+            if ws_skill_path.is_dir() {
+                // Check if this workspace skill shadows a user DB or built-in skill
+                let shadows_user_or_builtin = if let Ok(Some(_)) = repo.find_by_name_any_for_user(user_id, name).await {
+                    true
+                } else {
+                    paths.builtin_skills_dir.join(name).is_dir()
+                        || paths.builtin_skills_dir.join(BUILTIN_AUTO_SKILLS_SUBDIR).join(name).is_dir()
+                };
+                if shadows_user_or_builtin {
+                    info!(
+                        skill = %name,
+                        workspace_path = %ws_skill_path.display(),
+                        "Workspace skill shadows built-in or user-imported skill of the same name"
+                    );
+                }
+                return Ok(Some(ws_skill_path));
+            }
+        }
+    }
+
+    // 2. User-owned database skills
     if let Some(row) = repo.find_by_name_any_for_user(user_id, name).await? {
         let path = PathBuf::from(&row.path);
         if path.is_dir() {
@@ -1434,6 +1463,8 @@ async fn resolve_skill_source_path_with_repo_for_user(
             return Ok(None);
         }
     }
+
+    // 3. Built-in opt-in and auto-inject skills
     let top = paths.builtin_skills_dir.join(name);
     if top.is_dir() {
         return Ok(Some(top));
@@ -1455,6 +1486,189 @@ async fn resolve_skill_source_path_with_repo_for_user(
 /// Scan a directory for subdirectories containing SKILL.md.
 pub async fn scan_for_skills(folder_path: &Path) -> Result<Vec<ScannedSkill>, ExtensionError> {
     scan_skill_dirs(folder_path).await
+}
+
+/// Scan candidate directories inside a workspace for skills.
+///
+/// Discovers skills located in:
+/// 1. `<workspace>/.claude/skills/` (Claude Code parity)
+/// 2. `<workspace>/.agents/skills/` (cross-agent open standard)
+/// 3. `<workspace>/.aionrs/skills/` & `<workspace>/.aion/skills/` (Aion native)
+///
+/// This function only reads directory listings and parses frontmatter (`SKILL.md`).
+/// It must NEVER execute, source, or shell out to anything inside a scanned skill directory
+/// (including `scripts/`). Discovery and execution are strictly separate code paths.
+pub async fn scan_workspace_skills(workspace_path: &Path) -> Vec<ScannedSkill> {
+    scan_workspace_skills_bounded(workspace_path, workspace_path).await
+}
+
+/// Bounded workspace skill scanner supporting ascending search up to the git root.
+///
+/// # Workspace boundary (hard security requirement)
+/// Ascends from `start_path` up toward the git root, but the ascent **never** crosses above
+/// `boundary_root` (the tenant's registered workspace root). If no git root is found before hitting
+/// `boundary_root`, search stops at `boundary_root` and never continues into `$HOME`, `/`, or sibling
+/// tenants' directories.
+///
+/// Symlinks attempting to escape `boundary_root` are rejected and skipped.
+///
+/// # Nested-directory precedence tiebreak
+/// If a skill with the same name exists in two different candidate directory types at two different
+/// ancestor depths (e.g. `.claude/skills/foo` at the workspace root vs `.agents/skills/foo` one level down
+/// in a nested subdirectory), **directory-type order (`.claude` > `.agents` > `.aionrs`/`.aion`) wins
+/// over proximity**.
+///
+/// Within the same candidate directory type at different ancestor depths, **proximity (closer depth to
+/// `start_path`) wins**.
+pub async fn scan_workspace_skills_bounded(start_path: &Path, boundary_root: &Path) -> Vec<ScannedSkill> {
+    let canonical_boundary = match boundary_root.canonicalize() {
+        Ok(p) => p,
+        Err(_) => boundary_root.to_path_buf(),
+    };
+    let canonical_start = match start_path.canonicalize() {
+        Ok(p) => p,
+        Err(_) => start_path.to_path_buf(),
+    };
+
+    // If start_path is not inside boundary_root, clamp start to boundary
+    let start = if canonical_start.starts_with(&canonical_boundary) {
+        canonical_start
+    } else {
+        canonical_boundary.clone()
+    };
+
+    // Build ascending hierarchy: [start (deepest), parent, ..., boundary (highest)]
+    let mut hierarchy = Vec::new();
+    let mut current = start;
+    loop {
+        let reached_boundary = current == canonical_boundary;
+        let is_git_root = current.join(".git").exists();
+
+        hierarchy.push(current.clone());
+
+        if reached_boundary || is_git_root {
+            break;
+        }
+
+        match current.parent() {
+            Some(parent) if parent.starts_with(&canonical_boundary) => {
+                current = parent.to_path_buf();
+            }
+            _ => break,
+        }
+    }
+
+    // Candidate directory types in strict precedence order:
+    // 1. .claude/skills
+    // 2. .agents/skills
+    // 3. .aionrs/skills, .aion/skills
+    let candidate_categories: [&[&str]; 3] = [
+        &[".claude/skills"],
+        &[".agents/skills"],
+        &[".aionrs/skills", ".aion/skills"],
+    ];
+
+    let mut result_map: std::collections::HashMap<String, ScannedSkill> = std::collections::HashMap::new();
+
+    for category in candidate_categories {
+        // Within the same candidate directory type across different depths,
+        // iterate from index 0 (closest/deepest) to highest (boundary).
+        for dir in &hierarchy {
+            for rel_subpath in category {
+                let candidate_dir = dir.join(rel_subpath);
+                if !candidate_dir.is_dir() {
+                    continue;
+                }
+                let mut skill_dirs = Vec::new();
+                collect_skill_dirs_bounded(&candidate_dir, &canonical_boundary, &mut skill_dirs).await;
+
+                for skill_dir in skill_dirs {
+                    let manifest = skill_dir.join(SKILL_MANIFEST_FILE);
+                    let content = match tokio::fs::read_to_string(&manifest).await {
+                        Ok(c) => c,
+                        Err(e) => {
+                            warn!(path = %manifest.display(), error = %e, "failed to read workspace SKILL.md");
+                            continue;
+                        }
+                    };
+
+                    let (name, description) = match parse_frontmatter_fields(&content) {
+                        Some((n, d)) => {
+                            let final_name = if n.is_empty() {
+                                skill_dir
+                                    .file_name()
+                                    .map(|f| f.to_string_lossy().into_owned())
+                                    .unwrap_or_default()
+                            } else {
+                                n
+                            };
+                            (final_name, d)
+                        }
+                        None => {
+                            let fallback_name = skill_dir
+                                .file_name()
+                                .map(|f| f.to_string_lossy().into_owned())
+                                .unwrap_or_default();
+                            (fallback_name, String::new())
+                        }
+                    };
+
+                    if name.is_empty() {
+                        continue;
+                    }
+
+                    // First match wins: if a higher directory type already claimed this name,
+                    // or a closer depth within the same type already claimed it, do not overwrite.
+                    result_map.entry(name.clone()).or_insert_with(|| ScannedSkill {
+                        name,
+                        description,
+                        path: skill_dir.to_string_lossy().into_owned(),
+                    });
+                }
+            }
+        }
+    }
+
+    let mut list: Vec<ScannedSkill> = result_map.into_values().collect();
+    list.sort_by(|a, b| a.name.cmp(&b.name));
+    list
+}
+
+async fn collect_skill_dirs_bounded(
+    dir: &Path,
+    boundary: &Path,
+    result: &mut Vec<PathBuf>,
+) {
+    let canonical = match dir.canonicalize() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    if !canonical.starts_with(boundary) {
+        warn!(
+            path = %dir.display(),
+            target = %canonical.display(),
+            boundary = %boundary.display(),
+            "skipping symlink escaping workspace boundary"
+        );
+        return;
+    }
+
+    if dir.join(SKILL_MANIFEST_FILE).exists() {
+        result.push(dir.to_path_buf());
+        return;
+    }
+
+    let mut entries = match tokio::fs::read_dir(dir).await {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let entry_path = entry.path();
+        if entry_path.is_dir() {
+            Box::pin(collect_skill_dirs_bounded(&entry_path, boundary, result)).await;
+        }
+    }
 }
 
 /// Named filesystem path.
@@ -1743,7 +1957,7 @@ fn skill_row_to_list_item(paths: &SkillPaths, row: SkillRow, description: String
             .join(SKILL_MANIFEST_FILE)
             .to_string_lossy()
             .into_owned(),
-        SkillSource::Custom | SkillSource::Extension => row.path.clone(),
+        SkillSource::Custom | SkillSource::Extension | SkillSource::Workspace => row.path.clone(),
     };
 
     SkillListItem {
@@ -1761,6 +1975,7 @@ fn skill_source_from_row(source: &str) -> SkillSource {
         "builtin" => SkillSource::Builtin,
         "cron" => SkillSource::Cron,
         "extension" => SkillSource::Extension,
+        "workspace" => SkillSource::Workspace,
         _ => SkillSource::Custom,
     }
 }
@@ -1770,7 +1985,7 @@ fn skill_relative_location(paths: &SkillPaths, row: &SkillRow, source: SkillSour
     match source {
         SkillSource::Builtin => relative_skill_manifest_path(&paths.builtin_skills_dir, skill_dir),
         SkillSource::Cron => None,
-        SkillSource::Custom | SkillSource::Extension => None,
+        SkillSource::Custom | SkillSource::Extension | SkillSource::Workspace => None,
     }
 }
 

@@ -30,8 +30,16 @@ use crate::session_context::AionrsSessionBuildContext;
 use crate::types::{AionrsCompatOverrides, AionrsResolvedConfig};
 
 /// Render this conversation's skills index, or `""` when there is nothing to add.
-async fn skill_index_text(deps: &AgentFactoryDeps, user_id: &str, skills: &[String]) -> String {
-    let index = deps.skill_manager.discover_by_names_for_user(user_id, skills).await;
+async fn skill_index_text(
+    deps: &AgentFactoryDeps,
+    user_id: &str,
+    skills: &[String],
+    workspace: Option<&Path>,
+) -> String {
+    let index = deps
+        .skill_manager
+        .discover_by_names_for_user_with_workspace(user_id, skills, workspace)
+        .await;
     crate::capability::skill_manager::build_skills_index_text(&index)
 }
 
@@ -88,9 +96,10 @@ pub(super) async fn build(
     // reading the session-skills view directory directly), that is a change in
     // the aionrs crate itself, and this is where it would re-join the shared
     // delivery decision.
+    let workspace_path = Path::new(&ctx.workspace);
     overrides.system_prompt = merge_skill_index_into_system_prompt(
         overrides.system_prompt.take(),
-        &skill_index_text(&deps, &ctx.user_id, &resolved_skills).await,
+        &skill_index_text(&deps, &ctx.user_id, &resolved_skills, Some(workspace_path)).await,
     );
 
     let mut extra_mcp_servers = resolve_mcp_servers(&overrides);
@@ -557,7 +566,7 @@ async fn resolve_build_session(
             }
         }
 
-        let dropped = sanitize_session_messages(&mut session.messages);
+        let _dropped = sanitize_session_messages(&mut session.messages);
         return Ok(Some(session));
     }
 

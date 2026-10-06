@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Extension, Json, Path as AxumPath, State};
+use axum::extract::{Extension, Json, Path as AxumPath, Query, State};
 use axum::routing::{delete, get, post};
 use tracing::warn;
 
@@ -32,6 +32,7 @@ fn to_source_response(source: SkillSource) -> SkillSourceResponse {
         SkillSource::Custom => SkillSourceResponse::Custom,
         SkillSource::Cron => SkillSourceResponse::Cron,
         SkillSource::Extension => SkillSourceResponse::Extension,
+        SkillSource::Workspace => SkillSourceResponse::Workspace,
     }
 }
 
@@ -109,17 +110,45 @@ pub fn skill_routes(state: SkillRouterState) -> Router {
 // Skill listing & info
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, serde::Deserialize, Default)]
+struct ListSkillsQuery {
+    #[serde(default)]
+    workspace: Option<String>,
+}
+
 /// `GET /api/skills` — list all available skills.
 async fn list_skills(
     State(state): State<SkillRouterState>,
     Extension(current_user): Extension<CurrentUser>,
+    Query(query): Query<ListSkillsQuery>,
 ) -> Result<Json<ApiResponse<Vec<SkillListItemResponse>>>, ApiError> {
-    let items = skill_service::list_available_skills_with_repo_for_user(
+    let mut items = skill_service::list_available_skills_with_repo_for_user(
         &state.skill_paths,
         state.skill_repo.as_ref(),
         &current_user.id,
     )
     .await?;
+
+    if let Some(ws) = query.workspace.as_deref().filter(|s| !s.trim().is_empty()) {
+        let ws_skills = skill_service::scan_workspace_skills(Path::new(ws)).await;
+        for ws_skill in ws_skills {
+            let manifest_path = Path::new(&ws_skill.path).join(crate::constants::SKILL_MANIFEST_FILE);
+            let item = skill_service::SkillListItem {
+                name: ws_skill.name.clone(),
+                description: ws_skill.description,
+                location: manifest_path.to_string_lossy().into_owned(),
+                relative_location: None,
+                is_custom: false,
+                source: SkillSource::Workspace,
+            };
+            if let Some(pos) = items.iter().position(|i| i.name == ws_skill.name) {
+                items[pos] = item;
+            } else {
+                items.push(item);
+            }
+        }
+    }
+
     let resp: Vec<SkillListItemResponse> = items
         .into_iter()
         .map(|s| SkillListItemResponse {
@@ -388,6 +417,7 @@ async fn materialize_for_agent(
         &current_user.id,
         &req.conversation_id,
         &req.skills,
+        None,
     )
     .await?;
     let skills: Vec<MaterializedSkillRef> = resolved

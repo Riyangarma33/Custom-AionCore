@@ -87,6 +87,7 @@ async fn cron_skill_resolves_only_for_owning_user() {
         user_a,
         "conv-a",
         &["number-analysis".to_owned()],
+        None,
     )
     .await
     .unwrap();
@@ -101,6 +102,7 @@ async fn cron_skill_resolves_only_for_owning_user() {
         user_b,
         "conv-b",
         &["number-analysis".to_owned()],
+        None,
     )
     .await
     .unwrap();

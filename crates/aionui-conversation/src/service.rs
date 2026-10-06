@@ -1344,6 +1344,20 @@ impl ConversationService {
             );
         }
 
+        // Discover workspace skills as suggested/discovered list for Phase 2A modal display,
+        // without auto-activating or unioning into initial_skills / extra.skills.
+        if let Some(workspace_str) = extra.get("workspace").and_then(|v| v.as_str()) {
+            let ws_path = Path::new(workspace_str);
+            let discovered = aionui_extension::scan_workspace_skills(ws_path).await;
+            if !discovered.is_empty() {
+                if let Some(obj) = extra.as_object_mut() {
+                    let discovered_val = serde_json::to_value(&discovered).unwrap_or(serde_json::Value::Null);
+                    obj.insert("workspace_skills".to_owned(), discovered_val.clone());
+                    obj.insert("suggested_skills".to_owned(), discovered_val);
+                }
+            }
+        }
+
         let is_team_conversation = extra.get("teamId").is_some();
         let selected_mcp_server_ids = match extra.as_object_mut() {
             Some(obj) => {
@@ -4828,10 +4842,17 @@ impl ConversationService {
         });
         let skills_list = match requested_skills.as_deref() {
             Some(names) => {
-                // Resolve against the user's mounted skills; unknown names are
+                // Resolve against the user's mounted skills (including workspace skills); unknown names are
                 // rejected explicitly so the UI never persists a selection the
                 // runtime cannot honor.
-                let resolved = self.skill_resolver.resolve_skills_for_user(user_id, names).await;
+                let workspace_path = extra
+                    .get("workspace")
+                    .and_then(|v| v.as_str())
+                    .map(Path::new);
+                let resolved = self
+                    .skill_resolver
+                    .resolve_skills_for_user_with_workspace(user_id, names, workspace_path)
+                    .await;
                 let resolved_names: std::collections::HashSet<&str> =
                     resolved.iter().map(|skill| skill.name.as_str()).collect();
                 let unknown: Vec<String> = names
@@ -5471,6 +5492,22 @@ impl ConversationService {
         let auto_inject = self.skill_resolver.auto_inject_names().await;
         let mut mutated = backfill_skills_if_missing(extra, &auto_inject);
         mutated |= backfill_cron_job_id_alias(extra);
+
+        if extra.get("workspace_skills").is_none() {
+            if let Some(workspace_str) = extra.get("workspace").and_then(|v| v.as_str()) {
+                let ws_path = Path::new(workspace_str);
+                let discovered = aionui_extension::scan_workspace_skills(ws_path).await;
+                if !discovered.is_empty() {
+                    let discovered_val = serde_json::to_value(&discovered).unwrap_or(serde_json::Value::Null);
+                    if let Some(obj) = extra.as_object_mut() {
+                        obj.insert("workspace_skills".to_owned(), discovered_val.clone());
+                        obj.insert("suggested_skills".to_owned(), discovered_val);
+                        mutated = true;
+                    }
+                }
+            }
+        }
+
         if !mutated {
             return;
         }

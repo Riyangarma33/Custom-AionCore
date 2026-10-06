@@ -15,6 +15,7 @@ pub enum SkillSourceResponse {
     Custom,
     Cron,
     Extension,
+    Workspace,
 }
 
 /// Single item in the available skills list (`GET /api/skills`).

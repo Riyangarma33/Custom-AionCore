@@ -93,7 +93,7 @@ async fn same_named_skill_is_physically_isolated_per_user() {
 
     // Materialization is isolated: A resolves its own body, never B's.
     let resolved_a =
-        materialize_skills_for_agent_with_repo_for_user(paths, repo, &user_a, "conv-a", &["shared".into()])
+        materialize_skills_for_agent_with_repo_for_user(paths, repo, &user_a, "conv-a", &["shared".into()], None)
             .await
             .unwrap();
     assert_eq!(resolved_a.len(), 1);

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 
 use aionui_db::ISkillRepository;
@@ -129,7 +129,8 @@ impl AcpSkillManager {
                 }
                 aionui_extension::SkillSource::Custom
                 | aionui_extension::SkillSource::Cron
-                | aionui_extension::SkillSource::Extension => {
+                | aionui_extension::SkillSource::Extension
+                | aionui_extension::SkillSource::Workspace => {
                     enabled_skills.is_some_and(|en| en.iter().any(|n| n == &item.name))
                 }
             };
@@ -173,6 +174,15 @@ impl AcpSkillManager {
     }
 
     pub async fn discover_by_names_for_user(&self, user_id: &str, names: &[String]) -> Vec<SkillIndex> {
+        self.discover_by_names_for_user_with_workspace(user_id, names, None).await
+    }
+
+    pub async fn discover_by_names_for_user_with_workspace(
+        &self,
+        user_id: &str,
+        names: &[String],
+        workspace: Option<&Path>,
+    ) -> Vec<SkillIndex> {
         // Always reset state so repeated calls produce a deterministic cache.
         if names.is_empty() {
             let mut cache = self.cache.write().await;
@@ -181,13 +191,33 @@ impl AcpSkillManager {
             *discovered = true;
             return Vec::new();
         }
-        let items = match self.list_available_skills_for_user(user_id).await {
+        let mut items = match self.list_available_skills_for_user(user_id).await {
             Ok(v) => v,
             Err(e) => {
                 warn!(error = %e, "discover_by_names: list_available_skills failed");
                 Vec::new()
             }
         };
+
+        if let Some(ws) = workspace {
+            let ws_skills = aionui_extension::scan_workspace_skills(ws).await;
+            for ws_skill in ws_skills {
+                let manifest_path = Path::new(&ws_skill.path).join("SKILL.md");
+                let item = aionui_extension::SkillListItem {
+                    name: ws_skill.name.clone(),
+                    description: ws_skill.description,
+                    location: manifest_path.to_string_lossy().into_owned(),
+                    relative_location: None,
+                    is_custom: false,
+                    source: aionui_extension::SkillSource::Workspace,
+                };
+                if let Some(pos) = items.iter().position(|i| i.name == ws_skill.name) {
+                    items[pos] = item;
+                } else {
+                    items.push(item);
+                }
+            }
+        }
 
         let wanted: std::collections::HashSet<&String> = names.iter().collect();
         let mut cache = self.cache.write().await;
@@ -252,6 +282,15 @@ impl AcpSkillManager {
         user_id: &str,
         names: &[String],
     ) -> Vec<aionui_session::SkillDirSpec> {
+        self.resolve_skill_dirs_for_user_with_workspace(user_id, names, None).await
+    }
+
+    pub async fn resolve_skill_dirs_for_user_with_workspace(
+        &self,
+        user_id: &str,
+        names: &[String],
+        workspace: Option<&Path>,
+    ) -> Vec<aionui_session::SkillDirSpec> {
         if names.is_empty() {
             return Vec::new();
         }
@@ -263,6 +302,7 @@ impl AcpSkillManager {
                     user_id,
                     "skill-delivery",
                     names,
+                    workspace,
                 )
                 .await
             }
@@ -345,7 +385,8 @@ impl AcpSkillManager {
             }
             aionui_extension::SkillSource::Custom
             | aionui_extension::SkillSource::Cron
-            | aionui_extension::SkillSource::Extension => {
+            | aionui_extension::SkillSource::Extension
+            | aionui_extension::SkillSource::Workspace => {
                 // `location` for scanned user skills is the directory; append SKILL.md.
                 let skill_file = if def.location.is_dir() {
                     def.location.join("SKILL.md")

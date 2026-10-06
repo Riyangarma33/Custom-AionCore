@@ -127,10 +127,23 @@ impl TestHarness {
 
     /// Insert a conversation whose `extra.skills` snapshot is `skills`.
     pub async fn create_conversation(&self, user_id: &str, skills: &[&str]) -> String {
+        self.create_conversation_with_workspace(user_id, skills, None).await
+    }
+
+    /// Insert a conversation whose `extra.skills` snapshot is `skills` with an optional workspace path.
+    pub async fn create_conversation_with_workspace(
+        &self,
+        user_id: &str,
+        skills: &[&str],
+        workspace: Option<&str>,
+    ) -> String {
         self.ensure_user(user_id).await;
         let n = self.next_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let id = format!("conv_{user_id}_{n}");
-        let extra = serde_json::json!({ "skills": skills, "backend": "claude" });
+        let mut extra = serde_json::json!({ "skills": skills, "backend": "claude" });
+        if let Some(ws) = workspace {
+            extra["workspace"] = serde_json::json!(ws);
+        }
         let row = ConversationRow {
             id: id.clone(),
             user_id: user_id.to_owned(),
