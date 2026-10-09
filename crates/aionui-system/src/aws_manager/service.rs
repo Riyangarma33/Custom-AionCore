@@ -333,6 +333,9 @@ impl AwsManagerService {
         let (stdin_tx, mut stdin_rx) = mpsc::channel::<String>(4);
         let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
 
+        let stdin_auto_tx = stdin_tx.clone();
+        let stderr_stdin_tx = stdin_tx.clone();
+
         // Register in active maps
         {
             let mut active = self.active_profiles.lock().await;
@@ -352,6 +355,7 @@ impl AwsManagerService {
         }
 
         let job_id_clone = job_id.clone();
+        let job_id_err = job_id.clone();
         let profile_clone = profile.to_string();
         let auth_type_clone = auth_type.clone();
         let service_self = self.clone();
@@ -368,6 +372,16 @@ impl AwsManagerService {
                 }
                 let mut buf = stderr_buf_clone.lock().await;
                 buf.push_str(&line);
+                if line.contains("Do you want to overwrite it")
+                    || line.contains("(y/n)")
+                    || line.contains("already configured to use session")
+                {
+                    info!(
+                        job_id = %job_id_err,
+                        "AWS CLI stderr prompted for session overwrite confirmation; auto-confirming 'y'"
+                    );
+                    let _ = stderr_stdin_tx.send("y".to_string()).await;
+                }
                 if buf.len() > 4096 {
                     let drain_len = buf.len() - 4096;
                     buf.drain(..drain_len);
@@ -380,10 +394,10 @@ impl AwsManagerService {
         tokio::spawn(async move {
             let mut stdin = stdin;
             while let Some(code) = stdin_rx.recv().await {
-                info!(job_id = %job_id_clone, "Writing authorization code to child stdin");
+                info!(job_id = %job_id_clone, "Writing input to child stdin");
                 let to_write = format!("{code}\n");
                 if let Err(e) = stdin.write_all(to_write.as_bytes()).await {
-                    warn!(error = %e, "Failed to write code to AWS CLI stdin");
+                    warn!(error = %e, "Failed to write input to AWS CLI stdin");
                 }
                 let _ = stdin.flush().await;
             }
@@ -409,6 +423,7 @@ impl AwsManagerService {
 
             let mut stdout_done = false;
             let mut child_exited: Option<std::process::ExitStatus> = None;
+            let mut overwrite_confirmed = false;
 
             loop {
                 tokio::select! {
@@ -420,6 +435,20 @@ impl AwsManagerService {
                             Ok(n) => {
                                 stdout_buf.extend_from_slice(&chunk[..n]);
                                 let text = String::from_utf8_lossy(&stdout_buf);
+
+                                // Auto-respond 'y' if AWS CLI stdout prompts to confirm session overwrite
+                                if !overwrite_confirmed
+                                    && (text.contains("Do you want to overwrite it")
+                                        || text.contains("(y/n)")
+                                        || text.contains("already configured to use session"))
+                                {
+                                    overwrite_confirmed = true;
+                                    info!(
+                                        job_id = %job_id_sup,
+                                        "AWS CLI stdout prompted for session overwrite confirmation; auto-confirming 'y'"
+                                    );
+                                    let _ = stdin_auto_tx.send("y".to_string()).await;
+                                }
 
                                 if let Some(mut current) = store_sup.load_job(&job_id_sup) {
                                     let mut changed = false;

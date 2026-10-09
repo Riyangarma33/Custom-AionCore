@@ -297,16 +297,16 @@ pub fn load_all_profiles(config_path: &Path, creds_path: &Path) -> Vec<AwsProfil
 
         let auth_method = if sso_session.is_some() || sso_start_url.is_some() || sso_account_id.is_some() {
             AwsProfileAuthMethod::Sso
-        } else if login_session.is_some() {
-            AwsProfileAuthMethod::ConsoleLogin
-        } else if role_arn.is_some() && source_profile.is_some() {
+        } else if role_arn.is_some() || source_profile.is_some() {
             AwsProfileAuthMethod::AssumeRole
         } else if credential_process.is_some() {
             AwsProfileAuthMethod::CredentialProcess
         } else if effective_has_key {
             AwsProfileAuthMethod::StaticKey
         } else {
-            AwsProfileAuthMethod::Unknown
+            // Profile has no keys, no sso, no assume-role, no credential_process.
+            // In AWS CLI, profiles with login_session or empty/region-only profiles are Console Login profiles.
+            AwsProfileAuthMethod::ConsoleLogin
         };
 
         profiles.push(AwsProfileSummary {
@@ -491,13 +491,9 @@ pub fn save_profile(
         }
         if let Some(ls) = &req.login_session {
             let trimmed = ls.trim();
-            if !trimmed.is_empty() {
+            if !trimmed.is_empty() && trimmed != "pending" {
                 new_section.push(format!("login_session = {trimmed}"));
-            } else if req.auth_method.as_deref() == Some("console_login") {
-                new_section.push("login_session = pending".to_string());
             }
-        } else if req.auth_method.as_deref() == Some("console_login") {
-            new_section.push("login_session = pending".to_string());
         }
         if let Some(arn) = &req.role_arn {
             let trimmed = arn.trim();
@@ -884,6 +880,7 @@ aws_secret_access_key = SECRET_ACCESS_KEY_THAT_MUST_NEVER_LEAK
 
         // default is first
         assert_eq!(profiles[0].name, "default");
+        assert_eq!(profiles[0].auth_method, AwsProfileAuthMethod::ConsoleLogin);
 
         let sfa = profiles.iter().find(|p| p.name == "AryaNoble - SFA").unwrap();
         assert_eq!(sfa.auth_method, AwsProfileAuthMethod::Sso);
@@ -941,5 +938,45 @@ aws_secret_access_key = SECRET_ACCESS_KEY_THAT_MUST_NEVER_LEAK
         let profiles_after = load_all_profiles(&config_path, &creds_path);
         assert!(profiles_after.iter().find(|p| p.name == "test-new-profile").is_none());
         assert!(profiles_after.iter().find(|p| p.name == "initial").is_some());
+    }
+
+    #[test]
+    fn test_save_console_login_profile_without_login_session() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config");
+        let creds_path = dir.path().join("credentials");
+
+        fs::write(&config_path, "").unwrap();
+
+        let req = AwsSaveProfileRequest {
+            name: "dev-console".to_string(),
+            original_name: None,
+            region: Some("ap-southeast-1".to_string()),
+            output: Some("json".to_string()),
+            auth_method: Some("console_login".to_string()),
+            sso_session: None,
+            sso_start_url: None,
+            sso_region: None,
+            sso_account_id: None,
+            sso_role_name: None,
+            login_session: None,
+            role_arn: None,
+            source_profile: None,
+            aws_access_key_id: None,
+            aws_secret_access_key: None,
+            raw_config_section: None,
+        };
+
+        save_profile(&config_path, &creds_path, &req).unwrap();
+
+        // Verify config content does NOT contain "login_session = pending" or any login_session
+        let content = fs::read_to_string(&config_path).unwrap();
+        assert!(!content.contains("login_session"));
+
+        // Verify profile loaded is classified as ConsoleLogin with None login_session
+        let profiles = load_all_profiles(&config_path, &creds_path);
+        let p = profiles.iter().find(|p| p.name == "dev-console").unwrap();
+        assert_eq!(p.auth_method, AwsProfileAuthMethod::ConsoleLogin);
+        assert_eq!(p.login_session, None);
     }
 }
