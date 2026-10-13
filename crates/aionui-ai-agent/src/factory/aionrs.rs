@@ -102,6 +102,15 @@ pub(super) async fn build(
         &skill_index_text(&deps, &ctx.user_id, &resolved_skills, Some(workspace_path)).await,
     );
 
+    if let Some(spec_id) = overrides.active_spec_id.as_deref() {
+        if let Some(spec_prompt) = build_spec_context_prompt(workspace_path, spec_id) {
+            overrides.system_prompt = Some(match overrides.system_prompt.take() {
+                Some(existing) => format!("{existing}\n\n{spec_prompt}"),
+                None => spec_prompt,
+            });
+        }
+    }
+
     let mut extra_mcp_servers = resolve_mcp_servers(&overrides);
     if let Some(repo) = deps.mcp_server_repo.as_ref() {
         for (name, config) in load_user_mcp_servers(
@@ -1362,6 +1371,110 @@ fn team_mcp_to_config(cfg: &TeamMcpStdioConfig) -> HashMap<String, McpServerConf
     };
 
     HashMap::from([(TEAM_MCP_SERVER_NAME.to_owned(), server)])
+}
+
+fn build_spec_context_prompt(workspace: &Path, spec_id: &str) -> Option<String> {
+    let candidates = [
+        workspace.join(".aion").join("specs").join(spec_id),
+        workspace.join(".kiro").join("specs").join(spec_id),
+        workspace.join(".specs").join(spec_id),
+    ];
+    let spec_dir = candidates.into_iter().find(|p| p.is_dir())?;
+
+    let spec_json_path = spec_dir.join("spec.json");
+    let (title, spec_type, current_phase, active_wave) = if spec_json_path.is_file() {
+        std::fs::read_to_string(&spec_json_path)
+            .ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .map(|v| {
+                let title = v.get("title").and_then(|s| s.as_str()).unwrap_or(spec_id).to_string();
+                let spec_type = v.get("spec_type").and_then(|s| s.as_str()).unwrap_or("feature").to_string();
+                let phase = v.get("current_phase").and_then(|s| s.as_str()).unwrap_or("requirements").to_string();
+                let wave = v.get("active_wave").and_then(|n| n.as_u64()).unwrap_or(1);
+                (title, spec_type, phase, wave)
+            })
+            .unwrap_or_else(|| (spec_id.to_string(), "feature".into(), "requirements".into(), 1))
+    } else {
+        (spec_id.to_string(), "feature".into(), "requirements".into(), 1)
+    };
+
+    let read_bounded = |path: std::path::PathBuf, max_chars: usize| -> Option<String> {
+        if !path.is_file() {
+            return None;
+        }
+        let text = std::fs::read_to_string(path).ok()?;
+        if text.chars().count() > max_chars {
+            Some(format!("{}...\n[truncated]", text.chars().take(max_chars).collect::<String>()))
+        } else {
+            Some(text)
+        }
+    };
+
+    let req_content = read_bounded(spec_dir.join("requirements.md"), 4000)
+        .or_else(|| read_bounded(spec_dir.join("bugfix.md"), 4000))
+        .unwrap_or_else(|| "No requirements file drafted yet.".to_string());
+
+    let tasks_content = read_bounded(spec_dir.join("tasks.md"), 4000)
+        .unwrap_or_else(|| "No tasks file created yet.".to_string());
+
+    // Collect steering guidelines (bounded to 6000 chars total)
+    let mut steering_snippets = Vec::new();
+    let steering_roots = [
+        workspace.join(".aion").join("steering"),
+        workspace.join(".kiro").join("steering"),
+    ];
+    for root in steering_roots {
+        if root.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(root) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("md") {
+                        if let Some(content) = read_bounded(path.clone(), 1500) {
+                            steering_snippets.push(format!("### {}\n{}", path.file_name().unwrap_or_default().to_string_lossy(), content));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for root_file in ["AGENTS.md", "CLAUDE.md"] {
+        let p = workspace.join(root_file);
+        if p.is_file() {
+            if let Some(content) = read_bounded(p, 2500) {
+                steering_snippets.push(format!("### {root_file}\n{content}"));
+            }
+        }
+    }
+
+    let steering_text = if steering_snippets.is_empty() {
+        "None found.".to_string()
+    } else {
+        steering_snippets.join("\n\n")
+    };
+
+    Some(format!(
+r#"[Spec-Driven Development (SDD) Active Specification]
+Spec ID: {spec_id}
+Title: {title}
+Type: {spec_type}
+Current Phase: {current_phase}
+Active Wave: Wave {active_wave}
+
+## Active Requirements Summary
+{req_content}
+
+## Implementation Checklist
+{tasks_content}
+
+## Project Steering Guidelines
+{steering_text}
+
+## SDD Phased Approval Rules (Human-in-the-Loop Review Gates)
+- Phase 1 (Requirements): Draft requirements in EARS notation in requirements.md. Halt turn and request explicit user review before advancing to technical design.
+- Phase 2 (Design): Read steering guidelines and requirements, draft architecture in design.md. Halt turn and request explicit user approval before generating tasks.
+- Phase 3 (Tasks): Break design into DAG and waves in tasks.md with markdown checkboxes (- [ ]). Halt turn and request user approval of task breakdown.
+- Phase 4 (Execution): Work on ONE task at a time (or active wave) by default. Implement code, verify against acceptance criteria, update checkbox to - [x] in tasks.md on disk, and pause for user inspection. Do not roll through all tasks automatically unless explicitly instructed."#
+    ))
 }
 
 #[cfg(test)]

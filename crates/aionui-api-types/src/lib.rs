@@ -35,6 +35,7 @@ mod sidebar;
 mod skill;
 mod skill_delivery;
 mod skill_runtime;
+mod specs;
 mod system;
 mod team;
 mod team_mcp;
@@ -203,6 +204,7 @@ pub use skill_runtime::{
     RuntimeSkillShowResponse, SKILL_RUNTIME_SCHEMA_VERSION, SkillRuntimeEnvelope, SkillRuntimeErrorCode,
     SkillRuntimeErrorPayload, SkillRuntimeMeta,
 };
+pub use specs::*;
 pub use system::{
     ClientPreferencesResponse, CurrentUserResponse, FeedbackDiagnosticsContextResponse,
     FeedbackDiagnosticsPrivacyResponse, FeedbackDiagnosticsProfileResponse, FeedbackDiagnosticsQuery,

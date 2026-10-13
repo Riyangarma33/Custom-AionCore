@@ -16,6 +16,7 @@ pub mod routes;
 pub mod runtime;
 pub mod scm;
 mod service;
+pub mod specs;
 pub mod types;
 
 pub use chat_files::ResolvedChatMessage;

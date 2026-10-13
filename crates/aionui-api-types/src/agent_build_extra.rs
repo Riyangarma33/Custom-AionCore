@@ -84,6 +84,8 @@ pub struct AcpBuildExtra {
     #[serde(default)]
     pub current_model_id: Option<String>,
     #[serde(default)]
+    pub active_spec_id: Option<String>,
+    #[serde(default)]
     pub thought_level: Option<String>,
     #[serde(default)]
     pub cron_job_id: Option<String>,
@@ -128,6 +130,8 @@ pub struct AionrsBuildExtra {
     pub backend: Option<String>,
     #[serde(default)]
     pub user_id: Option<String>,
+    #[serde(default)]
+    pub active_spec_id: Option<String>,
     /// Present only on a forked conversation (see [`ForkSpec`]). Consumed by
     /// the aionrs factory on first open when no session exists for this
     /// conversation yet: the parent's session (keyed by

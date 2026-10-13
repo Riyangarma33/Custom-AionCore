@@ -19,20 +19,22 @@
 use std::sync::Arc;
 
 use aionui_api_types::{
-    ApiResponse, AttachFolderRequest, ProjectDetailResponse, ProjectEntry, ProjectExplorer, ResolveRefRequest,
-    ResolveRefResponse,
+    ApiResponse, AttachFolderRequest, CreateSpecRequest, LinkConversationRequest, PatchTaskRequest,
+    ProjectDetailResponse, ProjectEntry, ProjectExplorer, ResolveRefRequest, ResolveRefResponse, SpecDetail,
+    TransitionPhaseRequest, UpdateSpecFileRequest, WorkspaceSpecSummary,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Json, Path, State};
 use axum::http::StatusCode;
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, patch, post, put};
 use axum::{Extension, Router};
 use serde_json::json;
 
 use crate::canonical;
 use crate::service::ProjectService;
+use crate::specs::{SpecError, SpecService};
 use crate::types::{AttachInput, ProjectDetail, ProjectError, ProjectExplorerEntry};
 
 /// Shared state for project route handlers.
@@ -50,6 +52,12 @@ pub fn project_routes(state: ProjectRouterState) -> Router {
         .route("/api/projects/{project_id}/folders", post(attach_folder))
         .route("/api/projects/{project_id}/folders/{pe_id}", delete(remove_folder))
         .route("/api/projects/{project_id}/resolve-ref", post(resolve_ref))
+        .route("/api/projects/{project_id}/specs", get(list_specs).post(create_spec))
+        .route("/api/projects/{project_id}/specs/{spec_id}", get(get_spec))
+        .route("/api/projects/{project_id}/specs/{spec_id}/files/{filename}", put(update_spec_file))
+        .route("/api/projects/{project_id}/specs/{spec_id}/tasks/{task_id}", patch(patch_spec_task))
+        .route("/api/projects/{project_id}/specs/{spec_id}/phase", post(transition_spec_phase))
+        .route("/api/projects/{project_id}/specs/{spec_id}/link", post(link_spec_conversation))
         .with_state(state)
 }
 
@@ -246,6 +254,144 @@ impl From<ProjectError> for ApiError {
             other => other.to_string(),
         };
         ApiError::coded(status, code, message, details)
+    }
+}
+
+// ── SDD Spec Route Handlers ──────────────────────────────────────────────────
+
+async fn resolve_workspace_path(
+    state: &ProjectRouterState,
+    user_id: &str,
+    project_id: &str,
+) -> Result<std::path::PathBuf, ApiError> {
+    let detail = state.project.get_project(user_id, project_id).await?;
+    let ws_entry = detail
+        .explorer
+        .entries
+        .into_iter()
+        .find(|e| e.pe_id == detail.explorer.workspace_pe_id)
+        .ok_or_else(|| ApiError::NotFound("Workspace entry not found for project".into()))?;
+    let path = canonical::uri_to_path(&ws_entry.folder.resource_canonical)
+        .map_err(|e| ApiError::BadRequest(format!("Invalid workspace URI: {e}")))?;
+    Ok(path)
+}
+
+/// `GET /api/projects/{project_id}/specs` — enumerate all specs in workspace.
+async fn list_specs(
+    State(state): State<ProjectRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(project_id): Path<String>,
+) -> Result<Json<ApiResponse<Vec<WorkspaceSpecSummary>>>, ApiError> {
+    let ws_path = resolve_workspace_path(&state, &user.id, &project_id).await?;
+    let specs = SpecService::list_specs(&ws_path)?;
+    Ok(Json(ApiResponse::ok(specs)))
+}
+
+/// `POST /api/projects/{project_id}/specs` — initialize a new spec.
+async fn create_spec(
+    State(state): State<ProjectRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(project_id): Path<String>,
+    body: Result<Json<CreateSpecRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<SpecDetail>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let ws_path = resolve_workspace_path(&state, &user.id, &project_id).await?;
+    let spec = SpecService::create_spec(&ws_path, req)?;
+    Ok(Json(ApiResponse::ok(spec)))
+}
+
+/// `GET /api/projects/{project_id}/specs/{spec_id}` — fetch full spec details.
+async fn get_spec(
+    State(state): State<ProjectRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path((project_id, spec_id)): Path<(String, String)>,
+) -> Result<Json<ApiResponse<SpecDetail>>, ApiError> {
+    let ws_path = resolve_workspace_path(&state, &user.id, &project_id).await?;
+    let spec = SpecService::get_spec(&ws_path, &spec_id)?;
+    Ok(Json(ApiResponse::ok(spec)))
+}
+
+/// `PUT /api/projects/{project_id}/specs/{spec_id}/files/{filename}` — update spec markdown file.
+async fn update_spec_file(
+    State(state): State<ProjectRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path((project_id, spec_id, filename)): Path<(String, String, String)>,
+    body: Result<Json<UpdateSpecFileRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<SpecDetail>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let ws_path = resolve_workspace_path(&state, &user.id, &project_id).await?;
+    let spec = SpecService::update_spec_file(&ws_path, &spec_id, &filename, &req.content, req.expected_mtime)?;
+    Ok(Json(ApiResponse::ok(spec)))
+}
+
+/// `PATCH /api/projects/{project_id}/specs/{spec_id}/tasks/{task_id}` — toggle checklist item.
+async fn patch_spec_task(
+    State(state): State<ProjectRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path((project_id, spec_id, task_id)): Path<(String, String, String)>,
+    body: Result<Json<PatchTaskRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<SpecDetail>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let ws_path = resolve_workspace_path(&state, &user.id, &project_id).await?;
+    let spec = SpecService::patch_task(&ws_path, &spec_id, &task_id, req.status, req.expected_mtime)?;
+    Ok(Json(ApiResponse::ok(spec)))
+}
+
+/// `POST /api/projects/{project_id}/specs/{spec_id}/phase` — transition phase.
+async fn transition_spec_phase(
+    State(state): State<ProjectRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path((project_id, spec_id)): Path<(String, String)>,
+    body: Result<Json<TransitionPhaseRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<SpecDetail>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let ws_path = resolve_workspace_path(&state, &user.id, &project_id).await?;
+    let spec = SpecService::transition_phase(&ws_path, &spec_id, req.phase)?;
+    Ok(Json(ApiResponse::ok(spec)))
+}
+
+/// `POST /api/projects/{project_id}/specs/{spec_id}/link` — link conversation.
+async fn link_spec_conversation(
+    State(state): State<ProjectRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path((project_id, spec_id)): Path<(String, String)>,
+    body: Result<Json<LinkConversationRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<SpecDetail>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let ws_path = resolve_workspace_path(&state, &user.id, &project_id).await?;
+    let spec = SpecService::link_conversation(&ws_path, &spec_id, req.conversation_id)?;
+    Ok(Json(ApiResponse::ok(spec)))
+}
+
+impl From<SpecError> for ApiError {
+    fn from(err: SpecError) -> Self {
+        match err {
+            SpecError::SpecNotFound { id } => ApiError::NotFound(format!("spec not found: {id}")),
+            SpecError::TaskNotFound { id } => ApiError::NotFound(format!("task not found: {id}")),
+            SpecError::SpecAlreadyExists { id } => {
+                ApiError::coded(StatusCode::CONFLICT, "spec_already_exists", format!("spec already exists: {id}"), None)
+            }
+            SpecError::ConcurrentModification { file, disk_mtime, expected_mtime } => {
+                ApiError::coded(
+                    StatusCode::CONFLICT,
+                    "concurrent_modification",
+                    format!("concurrent modification on {file}: disk mtime {disk_mtime} differs from expected {expected_mtime}"),
+                    Some(json!({ "file": file, "disk_mtime": disk_mtime, "expected_mtime": expected_mtime })),
+                )
+            }
+            SpecError::ContainmentViolation { path, workspace } => {
+                ApiError::Forbidden(format!("containment violation: path '{path:?}' escapes workspace '{workspace:?}'"))
+            }
+            SpecError::InvalidFileName { filename } => {
+                ApiError::BadRequest(format!("invalid spec file name: {filename}"))
+            }
+            SpecError::Io { path, source } => {
+                ApiError::Internal(format!("io error on {path:?}: {source}"))
+            }
+            SpecError::Serialization(msg) => {
+                ApiError::Internal(format!("serialization error: {msg}"))
+            }
+        }
     }
 }
 

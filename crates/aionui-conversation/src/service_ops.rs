@@ -350,6 +350,27 @@ impl ConversationService {
             }
         }
 
+        // Spec-Driven Development (SDD) slash commands
+        let sdd_commands = [
+            ("spec new", "Launch new feature or bugfix spec wizard"),
+            ("spec status", "Display current spec phase, wave breakdown, and task progress card"),
+            ("spec run", "Execute specific or next available task (/spec run [task-id|next|all])"),
+            ("spec analyze", "Run deep requirement conflict & ambiguity analysis"),
+        ];
+
+        for (cmd, desc) in sdd_commands {
+            let cmd_name = cmd.to_string();
+            if !commands.iter().any(|c| c.command.trim_start_matches('/').to_lowercase() == cmd_name) {
+                commands.push(SlashCommandItem {
+                    command: cmd_name,
+                    description: desc.to_string(),
+                    completion_behavior: None,
+                    empty_turn_tip_code: None,
+                    empty_turn_tip_params: None,
+                });
+            }
+        }
+
         Ok(commands)
     }
 
