@@ -379,6 +379,77 @@ pub fn write_file_atomically(path: &Path, content: &str) -> std::io::Result<()> 
     Ok(())
 }
 
+/// Helper to identify all (start_line_idx, end_line_idx) ranges in an INI file matching a predicate.
+/// Each range represents [header_line, next_header_or_eof).
+/// Invariant: start < end for every returned range, and ranges are ordered in line index order.
+fn find_section_ranges<F>(lines: &[String], mut is_target_section: F) -> Vec<(usize, usize)>
+where
+    F: FnMut(&str) -> bool,
+{
+    let mut ranges = Vec::new();
+    let mut current_target_start = None;
+
+    for (idx, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') && trimmed.len() >= 2 {
+            if let Some(start) = current_target_start.take() {
+                ranges.push((start, idx));
+            }
+            let inner = &trimmed[1..trimmed.len() - 1];
+            if is_target_section(inner) {
+                current_target_start = Some(idx);
+            }
+        }
+    }
+
+    if let Some(start) = current_target_start {
+        ranges.push((start, lines.len()));
+    }
+
+    ranges
+}
+
+/// Replace or append a section in a list of lines.
+/// If `ranges` is empty, appends `new_section` at the end (with a separating blank line if needed).
+/// If `ranges` has 1 or more entries:
+///   - Removes all subsequent duplicate ranges in reverse order (preserving line indices for earlier lines).
+///   - Splices `new_section` into the first matching range.
+fn replace_or_append_section(
+    lines: &mut Vec<String>,
+    ranges: &[(usize, usize)],
+    new_section: Vec<String>,
+) {
+    if ranges.is_empty() {
+        if !lines.is_empty() && !lines.last().map(|s| s.trim().is_empty()).unwrap_or(false) {
+            lines.push(String::new());
+        }
+        lines.extend(new_section);
+    } else {
+        // Drain any subsequent duplicate sections in reverse order so line indices remain valid
+        for &(start, end) in ranges.iter().skip(1).rev() {
+            if start < end && end <= lines.len() {
+                lines.drain(start..end);
+            }
+        }
+        // Replace the first matching section with new_section
+        let (first_start, first_end) = ranges[0];
+        if first_start <= first_end && first_end <= lines.len() {
+            lines.splice(first_start..first_end, new_section);
+        } else {
+            lines.extend(new_section);
+        }
+    }
+}
+
+/// Delete all matching section ranges in reverse order so earlier line indices remain valid.
+fn delete_section_ranges(lines: &mut Vec<String>, ranges: &[(usize, usize)]) {
+    for &(start, end) in ranges.iter().rev() {
+        if start < end && end <= lines.len() {
+            lines.drain(start..end);
+        }
+    }
+}
+
 /// Save or update a profile in `config` (and optionally `credentials` if static keys are supplied).
 pub fn save_profile(
     config_path: &Path,
@@ -403,31 +474,9 @@ pub fn save_profile(
 
     // If original_name is provided and differs, handle rename
     let rename_from = req.original_name.as_deref().filter(|n| *n != name);
-
-    let mut lines: Vec<String> = existing_content.lines().map(|s| s.to_string()).collect();
-    let mut section_start = None;
-    let mut section_end = None;
-
     let search_name = rename_from.unwrap_or(name);
 
-    for (idx, line) in lines.iter().enumerate() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') && trimmed.ends_with(']') && trimmed.len() >= 2 {
-            let inner = &trimmed[1..trimmed.len() - 1];
-            let (st, sec_name) = parse_section_header(inner);
-            if (st == SectionType::Profile || (st == SectionType::Other && sec_name == "default"))
-                && sec_name == search_name
-            {
-                section_start = Some(idx);
-            } else if section_start.is_some() && section_end.is_none() {
-                section_end = Some(idx);
-            }
-        }
-    }
-
-    if section_start.is_some() && section_end.is_none() {
-        section_end = Some(lines.len());
-    }
+    let mut lines: Vec<String> = existing_content.lines().map(|s| s.to_string()).collect();
 
     // Construct new section content
     let mut new_section = Vec::new();
@@ -509,22 +558,15 @@ pub fn save_profile(
         }
     }
 
-    let updated_config = if let (Some(start), Some(end)) = (section_start, section_end) {
-        lines.splice(start..end, new_section);
-        lines.join("\n") + "\n"
-    } else {
-        let mut res = existing_content;
-        if !res.is_empty() && !res.ends_with('\n') {
-            res.push('\n');
-        }
-        if !res.is_empty() && !res.ends_with("\n\n") {
-            res.push('\n');
-        }
-        res.push_str(&new_section.join("\n"));
-        res.push('\n');
-        res
+    let is_target = |inner: &str| {
+        let (st, sec_name) = parse_section_header(inner);
+        (st == SectionType::Profile || (st == SectionType::Other && sec_name == "default"))
+            && sec_name == search_name
     };
+    let ranges = find_section_ranges(&lines, is_target);
+    replace_or_append_section(&mut lines, &ranges, new_section);
 
+    let updated_config = lines.join("\n") + "\n";
     write_file_atomically(config_path, &updated_config)
         .map_err(|e| format!("Failed to write AWS config: {e}"))?;
 
@@ -542,24 +584,8 @@ pub fn save_profile(
             };
 
             let mut cred_lines: Vec<String> = existing_creds.lines().map(|s| s.to_string()).collect();
-            let mut c_start = None;
-            let mut c_end = None;
-
-            for (idx, line) in cred_lines.iter().enumerate() {
-                let trimmed = line.trim();
-                if trimmed.starts_with('[') && trimmed.ends_with(']') && trimmed.len() >= 2 {
-                    let inner = clean_name(&trimmed[1..trimmed.len() - 1]);
-                    if inner == search_name {
-                        c_start = Some(idx);
-                    } else if c_start.is_some() && c_end.is_none() {
-                        c_end = Some(idx);
-                    }
-                }
-            }
-
-            if c_start.is_some() && c_end.is_none() {
-                c_end = Some(cred_lines.len());
-            }
+            let is_cred_target = |inner: &str| clean_name(inner) == search_name;
+            let c_ranges = find_section_ranges(&cred_lines, is_cred_target);
 
             let new_cred_sec = vec![
                 format!("[{name}]"),
@@ -567,24 +593,33 @@ pub fn save_profile(
                 format!("aws_secret_access_key = {secret_key}"),
             ];
 
-            let updated_creds = if let (Some(start), Some(end)) = (c_start, c_end) {
-                cred_lines.splice(start..end, new_cred_sec);
-                cred_lines.join("\n") + "\n"
-            } else {
-                let mut res = existing_creds;
-                if !res.is_empty() && !res.ends_with('\n') {
-                    res.push('\n');
-                }
-                if !res.is_empty() && !res.ends_with("\n\n") {
-                    res.push('\n');
-                }
-                res.push_str(&new_cred_sec.join("\n"));
-                res.push('\n');
-                res
-            };
-
+            replace_or_append_section(&mut cred_lines, &c_ranges, new_cred_sec);
+            let updated_creds = cred_lines.join("\n") + "\n";
             write_file_atomically(creds_path, &updated_creds)
                 .map_err(|e| format!("Failed to write AWS credentials: {e}"))?;
+        }
+    } else if let Some(old_name) = rename_from {
+        // If profile was renamed and had credentials under old_name, rename the credentials section
+        if creds_path.exists() {
+            let existing_creds = fs::read_to_string(creds_path).map_err(|e| format!("Failed to read credentials: {e}"))?;
+            let mut cred_lines: Vec<String> = existing_creds.lines().map(|s| s.to_string()).collect();
+            let is_cred_target = |inner: &str| clean_name(inner) == old_name;
+            let c_ranges = find_section_ranges(&cred_lines, is_cred_target);
+            if !c_ranges.is_empty() {
+                create_backup_copy(creds_path).map_err(|e| format!("Failed to backup AWS credentials: {e}"))?;
+                for &(start, end) in c_ranges.iter().skip(1).rev() {
+                    if start < end && end <= cred_lines.len() {
+                        cred_lines.drain(start..end);
+                    }
+                }
+                let (first_start, _) = c_ranges[0];
+                if first_start < cred_lines.len() {
+                    cred_lines[first_start] = format!("[{name}]");
+                }
+                let updated_creds = cred_lines.join("\n") + "\n";
+                write_file_atomically(creds_path, &updated_creds)
+                    .map_err(|e| format!("Failed to update credentials after rename: {e}"))?;
+            }
         }
     }
 
@@ -603,30 +638,14 @@ pub fn delete_profile(config_path: &Path, creds_path: &Path, name: &str) -> Resu
         let content = fs::read_to_string(config_path).map_err(|e| format!("Failed to read config: {e}"))?;
         let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
 
-        let mut start = None;
-        let mut end = None;
-
-        for (idx, line) in lines.iter().enumerate() {
-            let trimmed = line.trim();
-            if trimmed.starts_with('[') && trimmed.ends_with(']') && trimmed.len() >= 2 {
-                let inner = &trimmed[1..trimmed.len() - 1];
-                let (st, sec_name) = parse_section_header(inner);
-                if (st == SectionType::Profile || (st == SectionType::Other && sec_name == "default"))
-                    && sec_name == name
-                {
-                    start = Some(idx);
-                } else if start.is_some() && end.is_none() {
-                    end = Some(idx);
-                }
-            }
-        }
-
-        if start.is_some() && end.is_none() {
-            end = Some(lines.len());
-        }
-
-        if let (Some(s), Some(e)) = (start, end) {
-            lines.drain(s..e);
+        let is_target = |inner: &str| {
+            let (st, sec_name) = parse_section_header(inner);
+            (st == SectionType::Profile || (st == SectionType::Other && sec_name == "default"))
+                && sec_name == name
+        };
+        let ranges = find_section_ranges(&lines, is_target);
+        if !ranges.is_empty() {
+            delete_section_ranges(&mut lines, &ranges);
             let updated = lines.join("\n") + "\n";
             write_file_atomically(config_path, &updated)
                 .map_err(|e| format!("Failed to update config after delete: {e}"))?;
@@ -638,27 +657,10 @@ pub fn delete_profile(config_path: &Path, creds_path: &Path, name: &str) -> Resu
         let content = fs::read_to_string(creds_path).map_err(|e| format!("Failed to read credentials: {e}"))?;
         let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
 
-        let mut start = None;
-        let mut end = None;
-
-        for (idx, line) in lines.iter().enumerate() {
-            let trimmed = line.trim();
-            if trimmed.starts_with('[') && trimmed.ends_with(']') && trimmed.len() >= 2 {
-                let inner = clean_name(&trimmed[1..trimmed.len() - 1]);
-                if inner == name {
-                    start = Some(idx);
-                } else if start.is_some() && end.is_none() {
-                    end = Some(idx);
-                }
-            }
-        }
-
-        if start.is_some() && end.is_none() {
-            end = Some(lines.len());
-        }
-
-        if let (Some(s), Some(e)) = (start, end) {
-            lines.drain(s..e);
+        let is_cred_target = |inner: &str| clean_name(inner) == name;
+        let ranges = find_section_ranges(&lines, is_cred_target);
+        if !ranges.is_empty() {
+            delete_section_ranges(&mut lines, &ranges);
             let updated = lines.join("\n") + "\n";
             write_file_atomically(creds_path, &updated)
                 .map_err(|e| format!("Failed to update credentials after delete: {e}"))?;
@@ -739,25 +741,6 @@ pub fn save_sso_session(
     };
 
     let mut lines: Vec<String> = existing_content.lines().map(|s| s.to_string()).collect();
-    let mut section_start = None;
-    let mut section_end = None;
-
-    for (idx, line) in lines.iter().enumerate() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') && trimmed.ends_with(']') && trimmed.len() >= 2 {
-            let inner = &trimmed[1..trimmed.len() - 1];
-            let (st, sec_name) = parse_section_header(inner);
-            if st == SectionType::SsoSession && sec_name == name {
-                section_start = Some(idx);
-            } else if section_start.is_some() && section_end.is_none() {
-                section_end = Some(idx);
-            }
-        }
-    }
-
-    if section_start.is_some() && section_end.is_none() {
-        section_end = Some(lines.len());
-    }
 
     let mut new_section = Vec::new();
     if name.contains(' ') {
@@ -775,22 +758,14 @@ pub fn save_sso_session(
         .unwrap_or("sso:account:access");
     new_section.push(format!("sso_registration_scopes = {scopes}"));
 
-    let updated_config = if let (Some(start), Some(end)) = (section_start, section_end) {
-        lines.splice(start..end, new_section);
-        lines.join("\n") + "\n"
-    } else {
-        let mut res = existing_content;
-        if !res.is_empty() && !res.ends_with('\n') {
-            res.push('\n');
-        }
-        if !res.is_empty() && !res.ends_with("\n\n") {
-            res.push('\n');
-        }
-        res.push_str(&new_section.join("\n"));
-        res.push('\n');
-        res
+    let is_target = |inner: &str| {
+        let (st, sec_name) = parse_section_header(inner);
+        st == SectionType::SsoSession && sec_name == name
     };
+    let ranges = find_section_ranges(&lines, is_target);
+    replace_or_append_section(&mut lines, &ranges, new_section);
 
+    let updated_config = lines.join("\n") + "\n";
     write_file_atomically(config_path, &updated_config)
         .map_err(|e| format!("Failed to write AWS config: {e}"))?;
 
@@ -978,5 +953,94 @@ aws_secret_access_key = SECRET_ACCESS_KEY_THAT_MUST_NEVER_LEAK
         let p = profiles.iter().find(|p| p.name == "dev-console").unwrap();
         assert_eq!(p.auth_method, AwsProfileAuthMethod::ConsoleLogin);
         assert_eq!(p.login_session, None);
+    }
+
+    #[test]
+    fn test_save_and_rename_profile_with_duplicate_sections() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config");
+        let creds_path = dir.path().join("credentials");
+
+        let initial_config = r#"
+[profile 'Arista - Marketing']
+login_session = arn:aws:iam::717271747993:user/arista-webmarketing-admin
+region = ap-southeast-1
+
+[profile 'other-profile']
+region = us-west-2
+
+[profile Arista - Marketing]
+login_session = arn:aws:iam::717271747993:user/arista-webmarketing-admin
+"#;
+        fs::write(&config_path, initial_config).unwrap();
+
+        // 1. Rename 'Arista - Marketing' to 'Arista - WebMarketing'
+        let req = AwsSaveProfileRequest {
+            name: "Arista - WebMarketing".to_string(),
+            original_name: Some("Arista - Marketing".to_string()),
+            region: Some("ap-southeast-1".to_string()),
+            output: Some("json".to_string()),
+            auth_method: Some("console_login".to_string()),
+            sso_session: None,
+            sso_start_url: None,
+            sso_region: None,
+            sso_account_id: None,
+            sso_role_name: None,
+            login_session: Some("arn:aws:iam::717271747993:user/arista-webmarketing-admin".to_string()),
+            role_arn: None,
+            source_profile: None,
+            aws_access_key_id: None,
+            aws_secret_access_key: None,
+            raw_config_section: None,
+        };
+
+        // This must not panic and must succeed
+        save_profile(&config_path, &creds_path, &req).unwrap();
+
+        let profiles = load_all_profiles(&config_path, &creds_path);
+        // Original name must be gone
+        assert!(profiles.iter().find(|p| p.name == "Arista - Marketing").is_none());
+        // New name must exist and only once
+        let matching: Vec<_> = profiles.iter().filter(|p| p.name == "Arista - WebMarketing").collect();
+        assert_eq!(matching.len(), 1);
+        assert_eq!(matching[0].region.as_deref(), Some("ap-southeast-1"));
+        assert_eq!(matching[0].auth_method, AwsProfileAuthMethod::ConsoleLogin);
+        // Other profile must remain intact
+        assert!(profiles.iter().find(|p| p.name == "other-profile").is_some());
+
+        // Raw config check: no duplicate section headers
+        let content = fs::read_to_string(&config_path).unwrap();
+        assert!(!content.contains("Arista - Marketing']"));
+        assert!(!content.contains("Arista - Marketing]"));
+        assert!(content.contains("[profile 'Arista - WebMarketing']"));
+    }
+
+    #[test]
+    fn test_delete_profile_with_duplicate_sections() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config");
+        let creds_path = dir.path().join("credentials");
+
+        let initial_config = r#"
+[profile 'Arista - Marketing']
+region = ap-southeast-1
+
+[profile other]
+region = us-east-1
+
+[profile Arista - Marketing]
+region = ap-southeast-1
+"#;
+        fs::write(&config_path, initial_config).unwrap();
+
+        delete_profile(&config_path, &creds_path, "Arista - Marketing").unwrap();
+
+        let profiles = load_all_profiles(&config_path, &creds_path);
+        assert!(profiles.iter().find(|p| p.name == "Arista - Marketing").is_none());
+        assert!(profiles.iter().find(|p| p.name == "other").is_some());
+
+        let content = fs::read_to_string(&config_path).unwrap();
+        assert!(!content.contains("Arista - Marketing"));
+        assert!(content.contains("[profile other]"));
     }
 }
