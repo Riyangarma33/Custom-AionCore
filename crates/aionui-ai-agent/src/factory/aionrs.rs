@@ -110,7 +110,7 @@ pub(super) async fn build(
             });
         }
     } else {
-        let sdd_general = build_general_sdd_guidelines_prompt();
+        let sdd_general = build_general_sdd_guidelines_prompt(&ctx.conversation_id);
         overrides.system_prompt = Some(match overrides.system_prompt.take() {
             Some(existing) => format!("{existing}\n\n{sdd_general}"),
             None => sdd_general,
@@ -1379,8 +1379,9 @@ fn team_mcp_to_config(cfg: &TeamMcpStdioConfig) -> HashMap<String, McpServerConf
     HashMap::from([(TEAM_MCP_SERVER_NAME.to_owned(), server)])
 }
 
-fn build_general_sdd_guidelines_prompt() -> String {
-    r#"[Spec-Driven Development (SDD) & Kiro Parity Guidelines]
+fn build_general_sdd_guidelines_prompt(conversation_id: &str) -> String {
+    format!(
+r#"[Spec-Driven Development (SDD) & Kiro Parity Guidelines]
 When asked to design, plan, or build features using Spec-Driven Development (SDD), or when handling specifications:
 1. Canonical Location:
    All specifications MUST be stored under `<workspace>/.aion/specs/<spec-slug>/` (lowercase, kebab-case, e.g. `.aion/specs/hash-generator/`).
@@ -1404,20 +1405,21 @@ When asked to design, plan, or build features using Spec-Driven Development (SDD
      ```
    - `spec.json`: Machine-readable metadata:
      ```json
-     {
+     {{
        "id": "<spec-slug>",
        "title": "<Human Readable Title>",
        "spec_type": "feature",
        "workflow": "requirements_first",
        "current_phase": "requirements",
-       "active_wave": 1
-     }
+       "active_wave": 1,
+       "linked_conversation_id": "{conversation_id}"
+     }}
      ```
 3. Phased Review Boundaries (Human-in-the-Loop Review Gates):
-   - Phase 1 (Requirements): Draft `requirements.md`, write `spec.json` (`"current_phase": "requirements"`), and prompt the user to review before writing design.
+   - Phase 1 (Requirements): Draft `requirements.md`, write `spec.json` (`"current_phase": "requirements"`, preserving `"linked_conversation_id": "{conversation_id}"`), and prompt the user to review before writing design.
    - Phase 2 (Design): Draft `design.md`, update `spec.json` (`"current_phase": "design"`), and prompt the user to review before generating tasks.
    - Phase 3 (Tasks): Draft `tasks.md`, update `spec.json` (`"current_phase": "tasks"`), and prompt the user to review task ordering.
-   - Phase 4 (Execution): Implement code wave-by-wave or task-by-task, verifying each task against acceptance criteria, and update `tasks.md` checkbox state (`- [x]`) and `spec.json` (`"current_phase": "executing"` or `"completed"`)."#.to_string()
+   - Phase 4 (Execution): Implement code wave-by-wave or task-by-task, verifying each task against acceptance criteria, and update `tasks.md` checkbox state (`- [x]`) and `spec.json` (`"current_phase": "executing"` or `"completed"`)."#)
 }
 
 fn build_spec_context_prompt(workspace: &Path, spec_id: &str) -> Option<String> {
