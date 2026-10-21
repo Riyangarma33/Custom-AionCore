@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use aionui_api_types::{
     SpecLocationType, SpecPhase, SpecType, SpecWorkflow, TaskStatus, WorkspaceSpecSummary,
 };

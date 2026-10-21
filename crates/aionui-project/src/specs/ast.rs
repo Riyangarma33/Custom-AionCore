@@ -296,28 +296,30 @@ fn parse_task_body(
     }
 
     // Try to extract hierarchical number prefix: "1.", "1.1", "1.1.", "1.2.3"
-    let mut task_id = String::new();
-    let mut parent_id = None;
+    let prefix_info = {
+        let first_token = text.split_whitespace().next().unwrap_or("");
+        let clean_token = first_token.trim_end_matches(['.', ':', '-']);
+        let is_numeric = !clean_token.is_empty()
+            && clean_token
+                .split('.')
+                .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()));
 
-    let first_token = text.split_whitespace().next().unwrap_or("");
-    let clean_token = first_token.trim_end_matches(['.', ':', '-']);
-    let is_numeric_hierarchy = clean_token
-        .split('.')
-        .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()));
+        if is_numeric {
+            let id = clean_token.to_string();
+            let parent = clean_token.rfind('.').map(|last_dot| clean_token[..last_dot].to_string());
+            Some((id, parent, first_token.len()))
+        } else {
+            None
+        }
+    };
 
-    if is_numeric_hierarchy && !clean_token.is_empty() {
-        task_id = clean_token.to_string();
-        if let Some(last_dot) = clean_token.rfind('.') {
-            parent_id = Some(clean_token[..last_dot].to_string());
+    let (task_id, parent_id) = match prefix_info {
+        Some((id, parent, prefix_len)) => {
+            text = text[prefix_len..].trim().to_string();
+            (id, parent)
         }
-        // Remove number prefix from title
-        if let Some(rest) = text.strip_prefix(first_token) {
-            text = rest.trim().to_string();
-        }
-    } else {
-        // Fallback id: "<wave>.<counter>"
-        task_id = format!("{wave_num}.{counter}");
-    }
+        None => (format!("{wave_num}.{counter}"), None),
+    };
 
     (task_id, parent_id, text, refs)
 }
